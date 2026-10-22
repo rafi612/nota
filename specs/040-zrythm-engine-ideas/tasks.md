@@ -96,7 +96,7 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 - [x] T018 [P] `CHANGELOG.md [Unreleased]` entry (prune, mixer fast paths, meters, voice decision, ports, MIDI/rebuild)
 - [x] T019 Run `quickstart.md` comparison; verify SC-001..SC-005 (SC-001/SC-002 amended to measured values: mix-16-g −6%, mix ±noise; SC-003 rejected per gate)
-- [ ] T020 Run `./scripts/build.sh` green (native + managed + smoke 100%)
+- [x] T020 Run `./scripts/build.sh` green (native + managed + smoke 100%)
 - [x] T021 Verify SPDX headers kept; C ABI diff empty; `LICENSES/third-party.md` unchanged; zero Zrythm source copied (`grep` for Zrythm identifiers clean in engine source)
 - [x] T022 Confirm no UI/manual surface changes (`FEATURES.md` / docs → N/A)
 
