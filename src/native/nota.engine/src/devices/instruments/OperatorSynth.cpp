@@ -6,6 +6,8 @@
 
 #include "OperatorSynth.h"
 
+#include <unordered_map>
+
 namespace nota {
 
 OperatorSynth::OperatorSynth() {
@@ -62,6 +64,7 @@ void OperatorSynth::setSampleRate(double sr) {
 void OperatorSynth::noteExpression(int32_t pitch, int32_t dim, float value) {
     if (pitch < 0) {
         gexpr_.set(dim, value);
+        wake();
         return;
     }
     float add[kExprDims];
@@ -101,9 +104,15 @@ void OperatorSynth::pluginParamSet(int32_t i, float v) {
 }
 
 int32_t OperatorSynth::pluginParamIndexOfId(const std::string& id) const {
-    for (int32_t i = 0; i < kNumParams; ++i)
-        if (pluginParamId(i) == id) return i;
-    return -1;
+    // Built once: preset/automation apply looks up every parameter by id.
+    static const std::unordered_map<std::string, int32_t> map = [this] {
+        std::unordered_map<std::string, int32_t> m;
+        m.reserve(kNumParams * 2);
+        for (int32_t i = 0; i < kNumParams; ++i) m.emplace(pluginParamId(i), i);
+        return m;
+    }();
+    auto it = map.find(id);
+    return it == map.end() ? -1 : it->second;
 }
 
 std::vector<uint8_t> OperatorSynth::getState() const {
@@ -123,6 +132,7 @@ void OperatorSynth::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> OperatorSynth::clone() const {
@@ -178,6 +188,7 @@ void OperatorSynth::allNotesOff() {
 }
 
 void OperatorSynth::render(float* out, int32_t frames) {
+    if (idle_) return; // no free-running global clocks; voices are the only state
     const int algo = std::clamp((int)std::lround(get(Algo) * (kNumAlgos - 1.0f)), 0, kNumAlgos - 1);
     const int8_t* tgt = kAlgo[algo];
     const double fb = get(Feedback) * 0.9;

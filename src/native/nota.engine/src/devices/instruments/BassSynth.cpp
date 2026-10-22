@@ -11,6 +11,8 @@
 
 #include "dsp/math/FastMath.h"
 
+#include <unordered_map>
+
 namespace nota {
 
 BassSynth::BassSynth() {
@@ -82,9 +84,15 @@ std::string BassSynth::pluginParamName(int32_t i) const {
 }
 
 int32_t BassSynth::pluginParamIndexOfId(const std::string& id) const {
-    for (int32_t i = 0; i < kNumParams; ++i)
-        if (pluginParamId(i) == id) return i;
-    return -1;
+    // Built once: preset/automation apply looks up every parameter by id.
+    static const std::unordered_map<std::string, int32_t> map = [this] {
+        std::unordered_map<std::string, int32_t> m;
+        m.reserve(kNumParams * 2);
+        for (int32_t i = 0; i < kNumParams; ++i) m.emplace(pluginParamId(i), i);
+        return m;
+    }();
+    auto it = map.find(id);
+    return it == map.end() ? -1 : it->second;
 }
 
 std::vector<uint8_t> BassSynth::getState() const {
@@ -104,6 +112,7 @@ void BassSynth::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> BassSynth::clone() const {
@@ -204,6 +213,13 @@ void BassSynth::noteOff(int32_t pitch) {
 }
 
 void BassSynth::render(float* out, int32_t frames) {
+    if (idle_) {
+        // Shared LFO phase advances in O(1) time (S&H hold converged; params frozen
+        // while asleep since pluginParamSet wakes).
+        lfoPhase_ += expMap(get(LfoRate), 0.05, 30.0) / sampleRate_ * frames;
+        lfoPhase_ -= std::floor(lfoPhase_);
+        return;
+    }
     // ---- per-block param snapshot ----
     const double shape = std::clamp((double)get(OscShape), 0.0, 1.0);
     const double pw = 0.05 + 0.9 * get(OscPW);

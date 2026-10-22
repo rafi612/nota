@@ -7,6 +7,8 @@
 
 #include "Pentad.h"
 
+#include <unordered_map>
+
 namespace nota {
 
 Pentad::Pentad() {
@@ -141,9 +143,15 @@ const char* Pentad::paramName(int i) {
 }
 
 int32_t Pentad::pluginParamIndexOfId(const std::string& id) const {
-    for (int32_t i = 0; i < kNumParams; ++i)
-        if (id == paramId(i)) return i;
-    return -1;
+    // Built once: preset/automation apply looks up every parameter by id.
+    static const std::unordered_map<std::string, int32_t> map = [] {
+        std::unordered_map<std::string, int32_t> m;
+        m.reserve(kNumParams * 2);
+        for (int32_t i = 0; i < kNumParams; ++i) m.emplace(paramId(i), i);
+        return m;
+    }();
+    auto it = map.find(id);
+    return it == map.end() ? -1 : it->second;
 }
 
 std::vector<uint8_t> Pentad::getState() const {
@@ -163,6 +171,7 @@ void Pentad::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> Pentad::clone() const {
@@ -281,17 +290,35 @@ void Pentad::noteOff(int32_t pitch) {
 void Pentad::noteExpression(int32_t pitch, int32_t dim, float value) {
     if (pitch < 0) {
         gexpr_.set(dim, value);
+        wake();
         return;
     }
     if (dim < 0 || dim >= kExprDims) return;
+    bool matched = false;
     for (auto& V : voices_) {
-        if (V.gate && V.note == pitch && V.pendNote < 0) V.ex.set(dim, value, kNoExprAdd);
+        if (V.gate && V.note == pitch && V.pendNote < 0) {
+            V.ex.set(dim, value, kNoExprAdd);
+            matched = true;
+        }
         if (V.pendNote == pitch) V.pendExpr[dim] = value; // a stolen voice still fading out
     }
+    if (matched || activeCount_ > 0) wake();
 }
 
 void Pentad::render(float* out, int32_t frames) {
     dsp::ScopedNoDenormals ftz;
+    if (idle_) {
+        // Free-running LFO phase and transport clock advance in O(1) time. When
+        // tempo-synced, the phase re-anchors to transport on wake via tFresh_;
+        // smoothed controls converged during the hangover.
+        const bool lfoSync = get(LfoSync) > 0.5f && tSpb_ > 0.0;
+        double inc = (double)lfoHzOf(get(LfoRate)) / sampleRate_;
+        if (lfoSync) inc = 1.0 / ((double)syncBeatsOf(get(LfoRate)) * tSpb_);
+        lfoPh_ += inc * frames;
+        lfoPh_ -= std::floor(lfoPh_);
+        tFrames_ += frames;
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     const double pr = pendingRate_.load(std::memory_order_relaxed);
     if (pr != sampleRate_) { // voices keep playing; only rate-derived state restarts

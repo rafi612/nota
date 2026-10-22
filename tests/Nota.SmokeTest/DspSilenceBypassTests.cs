@@ -105,6 +105,63 @@ internal static class DspSilenceBypassTests
         return sound;
     }
 
+    // ---- instrument sleep/wake transparency (specs/037 US1) --------------------------
+    // Built-in synth kinds under test here.
+    private const int Aurora = 5, Volt = 6, PentadKind = 14, Rack = 3;
+
+    private static void SetInstParams(NotaEngine e, int t, (string Id, float V)[] ps)
+    {
+        foreach (var (id, v) in ps)
+        {
+            int n = e.PluginParamCount(t, -1);
+            for (int i = 0; i < n; i++)
+                if (e.PluginParamId(t, -1, i) == id) { e.PluginParamSet(t, -1, i, v); break; }
+        }
+    }
+
+    // Deterministic setups: free-running modulation and FX tails off, so a slept
+    // run must null exactly against a never-slept reference (phases still advance
+    // while asleep, but at zero depth they cannot affect the output).
+    private static readonly (string Id, float V)[] AuroraStill = new[]
+    {
+        ("lfo1depth", 0f), ("lfo2depth", 0f), ("fxchorus", 0f), ("fxreverb", 0f), ("fxdrive", 0f),
+    };
+    private static readonly (string Id, float V)[] VoltStill = new[]
+    {
+        ("lfo1depth", 0f), ("lfo2depth", 0f), ("vibamt", 0f),
+    };
+    private static readonly (string Id, float V)[] PentadStill = new[]
+    {
+        ("lfoamt", 0f),
+    };
+
+    // Post-note audio on a built-in instrument: silence soaks in first (the idle
+    // hangover engages — 64 blocks clears the 16384-sample hangover with margin),
+    // then note-on.
+    private static float[] SleptTakeInst(int kind, (string Id, float V)[] setup, int silentBlocks, int soundBlocks)
+    {
+        using var e = new NotaEngine();
+        int t = e.AddInstrumentTrack();
+        e.SetTrackBuiltinInstrument(t, kind);
+        SetInstParams(e, t, setup);
+        Render(e, silentBlocks);
+        e.TrackNoteOn(t, 60, 0.8f);
+        var sound = Render(e, soundBlocks);
+        e.TrackNoteOff(t, 60);
+        return sound;
+    }
+    private static float[] FreshTakeInst(int kind, (string Id, float V)[] setup, int soundBlocks)
+    {
+        using var e = new NotaEngine();
+        int t = e.AddInstrumentTrack();
+        e.SetTrackBuiltinInstrument(t, kind);
+        SetInstParams(e, t, setup);
+        e.TrackNoteOn(t, 60, 0.8f);
+        var sound = Render(e, soundBlocks);
+        e.TrackNoteOff(t, 60);
+        return sound;
+    }
+
     public static IEnumerable<(bool, string)> Run()
     {
         // ---- sleep/wake transparency: Utility (stateless gain) -------------------------
@@ -235,6 +292,49 @@ internal static class DspSilenceBypassTests
                 $"bypassed delay passes the dry signal instead of muting (rms {rms:F4})");
             yield return (diff < 1e-6,
                 $"bypassed delay output equals the no-device render (maxdiff {diff:E1})");
+        }
+
+        // ---- instrument sleep/wake transparency: Aurora / Volt / Pentad ----------------
+        // 64 silent blocks engage the idle hangover; the deterministic setups above
+        // make the wake-up exactly reproducible (free-running phases advance while
+        // asleep but sit at zero depth, so they cannot colour the output).
+        foreach (var (name, kind, setup) in new[]
+            { ("Aurora", Aurora, AuroraStill), ("Volt", Volt, VoltStill), ("Pentad", PentadKind, PentadStill) })
+        {
+            var slept = SleptTakeInst(kind, setup, 64, 16);
+            var fresh = FreshTakeInst(kind, setup, 16);
+            double diff = MaxDiff(slept, fresh), rms = Rms(slept), step = MaxStep(slept, 2);
+            yield return (Finite(slept) && rms > 0.01,
+                $"{name} wakes sounding and finite after 64 silent blocks (rms {rms:F4})");
+            yield return (step < 0.5,
+                $"{name} wakes without a click (max step in first 2 blocks {step:F4})");
+            yield return (diff < 1e-6,
+                $"{name} output after the silent soak matches the never-slept reference (maxdiff {diff:E1})");
+        }
+
+        // ---- instrument tail settles into silence (sleep engages, no stuck voice) -----
+        {
+            using var e = new NotaEngine();
+            int t = e.AddInstrumentTrack();
+            e.SetTrackBuiltinInstrument(t, Aurora);
+            SetInstParams(e, t, AuroraStill);
+            e.TrackNoteOn(t, 60, 0.8f);
+            Render(e, 16);
+            e.TrackNoteOff(t, 60);
+            var tail = Render(e, 200);
+            double late = PeakRange(tail, 192, 200);
+            yield return (Finite(tail) && late < 1e-4,
+                $"Aurora tail decays below 1e-4 within 200 blocks (late peak {late:E1})");
+        }
+
+        // ---- rack with an idle chain renders silence without errors -------------------
+        {
+            using var e = new NotaEngine();
+            int t = e.AddInstrumentTrack();
+            e.SetTrackBuiltinInstrument(t, Rack);
+            var silence = Render(e, 64);
+            yield return (Finite(silence) && PeakRange(silence, 0, 64) < 1e-6,
+                "Instrument Rack stays silent and finite through 64 silent blocks");
         }
     }
 }

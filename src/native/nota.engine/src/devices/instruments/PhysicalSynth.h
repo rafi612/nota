@@ -173,9 +173,11 @@ class PhysicalSynth final : public Instrument {
     // gain is ~amp for an impulse, but a sustained sine on its resonance rings it up by
     // ~τ·sr — so in series each mode is normalised to a peak gain of ~amp (a resonant
     // band-pass), and bank 2 colours bank 1 instead of exploding.
+    // State/coefficient arrays are 16-byte aligned so bank()/bankSerial() can step
+    // two double modes per vector instruction (NOTA_SIMD_NEON / NOTA_SIMD_SSE).
     struct Bank {
-        double a1[kModes] = {}, a2[kModes] = {}, b0[kModes] = {}, bs[kModes] = {}; // 2R cos w, R², input gains
-        double y1[kModes] = {}, y2[kModes] = {};
+        alignas(16) double a1[kModes] = {}, a2[kModes] = {}, b0[kModes] = {}, bs[kModes] = {}; // 2R cos w, R², input gains
+        alignas(16) double y1[kModes] = {}, y2[kModes] = {};
         double R[kModes] = {}, w[kModes] = {}, amp[kModes] = {}; // as built, for retune()
         float bowNorm = 0.0f;                                    // bow noise gain (see render)
     };

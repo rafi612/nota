@@ -80,6 +80,24 @@ void RackInstrument::render(float* out, int32_t frames) {
             c.ctl->meter.store(0.0f, std::memory_order_relaxed);
             continue;
         }
+        // Idle-chain bypass: the instrument and every non-bypassed chain device
+        // report isIdle (tails fully decayed). render() still runs so the
+        // instrument's free-running clocks advance in O(1) time, but scratch_
+        // needs no zeroing and silent devices/summing are skipped. Output stays
+        // silent: nothing is added to out.
+        bool chainIdle = c.instrument->isIdle();
+        if (chainIdle) {
+            for (auto& d : c.devices)
+                if (d && !d->bypassed() && !d->isIdle()) {
+                    chainIdle = false;
+                    break;
+                }
+        }
+        if (chainIdle) {
+            c.instrument->render(scratch_, frames);
+            c.ctl->meter.store(0.0f, std::memory_order_relaxed);
+            continue;
+        }
         std::memset(scratch_, 0, sizeof(float) * frames * 2);
         c.instrument->render(scratch_, frames);
         for (auto& d : c.devices)

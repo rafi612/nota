@@ -1783,7 +1783,9 @@ class Engine {
     // clocks) and misses MORE deadlines (waking takes a good part of a short buffer). So
     // the pool joins only under sustained overload: when leafWorkNs_ — the single-thread
     // cost of the parallel leaves, measured on blocks this thread renders alone, smoothed
-    // by 1/16 so a few slow blocks don't count — passes the buffer period.
+    // by 1/16 so a few slow blocks don't count — passes the buffer period, or
+    // proactively at kRtEngageLoad of the period (2+ eligible tracks, 128+ frames) so
+    // the first overload never lands on a cold pool.
     // Leaving needs care: while the pool runs, a block this thread renders alone reads
     // 1.5-2x its real cost (its core runs cold, the DSP state sits in other cores' caches),
     // and dropping to one thread blindly to re-measure made a burst of late blocks at every
@@ -1799,6 +1801,7 @@ class Engine {
     double rtParallelLeftNs_ = 0;
     double rtProbeLeftNs_ = 0;
     static constexpr double kRtSizeLoad = 0.85; // helpers: finish within this much of the buffer
+    static constexpr double kRtEngageLoad = 0.65; // engage before the first xrun past this much of the buffer
     static constexpr double kRtHoldSeconds = 2.0;
     static constexpr double kRtMaxHoldSeconds = 32.0;
     static constexpr double kRtProbeSeconds = 0.5;

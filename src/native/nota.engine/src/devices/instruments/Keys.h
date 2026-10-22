@@ -264,7 +264,11 @@ class Keys final : public Instrument {
         int32_t pitch = 60, model = 0;
         float vel = 0.0f, peak = 0.0f, level = 1.0f, symOff = 0.0f;
         int nModes = 0;
-        float a1[kMaxModes] = {}, a2[kMaxModes] = {}, b[kMaxModes] = {}, y1[kMaxModes] = {}, y2[kMaxModes] = {};
+        // 16-byte aligned: renderVoice() steps four float modes per vector
+        // instruction (NOTA_SIMD_NEON / NOTA_SIMD_SSE). Slots at/above nModes are
+        // kept zeroed by strike(), so the padded tail contributes exact silence.
+        alignas(16) float a1[kMaxModes] = {}, a2[kMaxModes] = {}, b[kMaxModes] = {}, y1[kMaxModes] = {},
+            y2[kMaxModes] = {};
         float w[kMaxModes] = {}, R[kMaxModes] = {}, Rd[kMaxModes] = {}, amp[kMaxModes] = {};
         // hammer pulse
         int pulseN = 0, pulsePos = 0;

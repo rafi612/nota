@@ -63,6 +63,24 @@ void DrumRack::render(float* out, int32_t frames) {
             c.ctl->retrig = false;
             continue;
         }
+        // Idle-pad bypass (RhythmMachine precedent): the pad instrument and every
+        // non-bypassed device report isIdle, no retrig is pending, and the pad
+        // decay VCA has settled. render() still runs for O(1) clock advance.
+        bool chainIdle = !c.ctl->retrig && c.instrument->isIdle();
+        if (chainIdle) {
+            for (auto& d : c.devices)
+                if (d && !d->bypassed() && !d->isIdle()) {
+                    chainIdle = false;
+                    break;
+                }
+        }
+        const float decPeek = c.ctl->decay.load(std::memory_order_relaxed);
+        if (chainIdle && decPeek < 0.999f && c.ctl->ampEnv > 1e-5f) chainIdle = false;
+        if (chainIdle) {
+            c.instrument->render(scratch_, frames);
+            c.ctl->meter.store(0.0f, std::memory_order_relaxed);
+            continue;
+        }
         std::memset(scratch_, 0, sizeof(float) * frames * 2);
         c.instrument->render(scratch_, frames);
         for (auto& d : c.devices)

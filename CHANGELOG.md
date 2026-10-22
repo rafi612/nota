@@ -182,6 +182,13 @@ Entry categories: `Added`, `Changed`, `Fixed`, `Removed`.
   about 2.5× faster with bit-identical sound — block-constant unison, chorus and pitch
   math is hoisted out of the per-sample loop. The `aurora-supersaw-2x` benchmark scenario
   and the Aurora null-test gate in the smoke test cover the change.
+- **Silent instrument tracks no longer burn CPU**: eight built-in synthesizers (Aurora,
+  Volt, Pentad, Consort, Operator, Flux, Bass, Synth) and idle Instrument/Drum Rack
+  chains now skip rendering once their voices and tails decay, waking sample-accurately
+  on the next event. Aurora's wavetable and chorus hot loops are branch-trimmed,
+  Physical/Keys modal resonators run on SIMD, and the mixer does gain, safety-clip and
+  metering in one vector pass. `silent-32` renders about 2× faster, dense Aurora
+  patches a further ~7%, all null-tested bit-identical.
 
 ## [0.56.1] — 2026-10-19
 

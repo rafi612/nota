@@ -9,6 +9,8 @@
 
 #include "dsp/math/FastMath.h"
 
+#include <unordered_map>
+
 namespace nota {
 
 FluxSynth::FluxSynth() {
@@ -62,9 +64,15 @@ void FluxSynth::pluginParamSet(int32_t i, float v) {
 }
 
 int32_t FluxSynth::pluginParamIndexOfId(const std::string& id) const {
-    for (int32_t i = 0; i < kNumParams; ++i)
-        if (pluginParamId(i) == id) return i;
-    return -1;
+    // Built once: preset/automation apply looks up every parameter by id.
+    static const std::unordered_map<std::string, int32_t> map = [this] {
+        std::unordered_map<std::string, int32_t> m;
+        m.reserve(kNumParams * 2);
+        for (int32_t i = 0; i < kNumParams; ++i) m.emplace(pluginParamId(i), i);
+        return m;
+    }();
+    auto it = map.find(id);
+    return it == map.end() ? -1 : it->second;
 }
 
 std::vector<uint8_t> FluxSynth::getState() const {
@@ -84,6 +92,7 @@ void FluxSynth::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> FluxSynth::clone() const {
@@ -135,6 +144,18 @@ void FluxSynth::allNotesOff() {
 }
 
 void FluxSynth::render(float* out, int32_t frames) {
+    if (idle_) {
+        // Tempo-synced vector motion and analog drift advance in O(1) time.
+        // Sidechain/reverb tails converged during the hangover; react amount is
+        // frozen at near-zero until wake.
+        const int rIdx = std::clamp((int)std::lround(get(MotRate) * 5.0f), 0, 5);
+        const double cycleBeats = kMotBeats[rIdx];
+        motionPhase_ += (double)frames / (std::max(1.0, cycleBeats * spb_));
+        motionPhase_ -= std::floor(motionPhase_);
+        driftPhase_ += 0.4 / sampleRate_ * frames;
+        driftPhase_ -= std::floor(driftPhase_);
+        return;
+    }
     // ---- 1) React: analyse the sidechain (or self) once per block ------
     analyzeSidechain(frames);
     const int target = std::clamp((int)std::lround(get(Target) * 3.0f), 0, 3);

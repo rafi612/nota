@@ -8,6 +8,8 @@
 
 #include "PhysicalSynth.h"
 
+#include "dsp/math/Simd.h"
+
 namespace nota {
 
 PhysicalSynth::PhysicalSynth() {
@@ -380,6 +382,43 @@ float PhysicalSynth::svf(double& ic1, double& ic2, double fc, double k, double i
 }
 
 float PhysicalSynth::bank(Bank& b, float x) {
+#if defined(NOTA_SIMD_NEON)
+    // Two double modes per step; per-lane op order matches the scalar loop exactly,
+    // so lanes are bit-identical and only the final pair-sum order differs (< -300 dB).
+    const float64x2_t xv = vdupq_n_f64((double)x);
+    float64x2_t acc = vdupq_n_f64(0.0);
+    for (int m = 0; m < kModes; m += 2) {
+        float64x2_t b0 = vld1q_f64(&b.b0[m]);
+        float64x2_t a1 = vld1q_f64(&b.a1[m]);
+        float64x2_t a2 = vld1q_f64(&b.a2[m]);
+        float64x2_t y1 = vld1q_f64(&b.y1[m]);
+        float64x2_t y2 = vld1q_f64(&b.y2[m]);
+        float64x2_t y = vsubq_f64(vaddq_f64(vmulq_f64(b0, xv), vmulq_f64(a1, y1)), vmulq_f64(a2, y2));
+        vst1q_f64(&b.y2[m], y1);
+        vst1q_f64(&b.y1[m], y);
+        acc = vaddq_f64(acc, y);
+    }
+    double s[2];
+    vst1q_f64(s, acc);
+    return static_cast<float>(s[0] + s[1]);
+#elif defined(NOTA_SIMD_SSE)
+    const __m128d xv = _mm_set1_pd((double)x);
+    __m128d acc = _mm_setzero_pd();
+    for (int m = 0; m < kModes; m += 2) {
+        __m128d b0 = _mm_load_pd(&b.b0[m]);
+        __m128d a1 = _mm_load_pd(&b.a1[m]);
+        __m128d a2 = _mm_load_pd(&b.a2[m]);
+        __m128d y1 = _mm_load_pd(&b.y1[m]);
+        __m128d y2 = _mm_load_pd(&b.y2[m]);
+        __m128d y = _mm_sub_pd(_mm_add_pd(_mm_mul_pd(b0, xv), _mm_mul_pd(a1, y1)), _mm_mul_pd(a2, y2));
+        _mm_store_pd(&b.y2[m], y1);
+        _mm_store_pd(&b.y1[m], y);
+        acc = _mm_add_pd(acc, y);
+    }
+    double s[2];
+    _mm_storeu_pd(s, acc);
+    return static_cast<float>(s[0] + s[1]);
+#else
     double acc = 0.0;
     for (int m = 0; m < kModes; ++m) {
         const double y = b.b0[m] * x + b.a1[m] * b.y1[m] - b.a2[m] * b.y2[m];
@@ -388,9 +427,45 @@ float PhysicalSynth::bank(Bank& b, float x) {
         acc += y;
     }
     return static_cast<float>(acc);
+#endif
 }
 
 float PhysicalSynth::bankSerial(Bank& b, float x) {
+#if defined(NOTA_SIMD_NEON)
+    const float64x2_t xv = vdupq_n_f64((double)x);
+    float64x2_t acc = vdupq_n_f64(0.0);
+    for (int m = 0; m < kModes; m += 2) {
+        float64x2_t bs = vld1q_f64(&b.bs[m]);
+        float64x2_t a1 = vld1q_f64(&b.a1[m]);
+        float64x2_t a2 = vld1q_f64(&b.a2[m]);
+        float64x2_t y1 = vld1q_f64(&b.y1[m]);
+        float64x2_t y2 = vld1q_f64(&b.y2[m]);
+        float64x2_t y = vsubq_f64(vaddq_f64(vmulq_f64(bs, xv), vmulq_f64(a1, y1)), vmulq_f64(a2, y2));
+        vst1q_f64(&b.y2[m], y1);
+        vst1q_f64(&b.y1[m], y);
+        acc = vaddq_f64(acc, y);
+    }
+    double s[2];
+    vst1q_f64(s, acc);
+    return static_cast<float>(s[0] + s[1]);
+#elif defined(NOTA_SIMD_SSE)
+    const __m128d xv = _mm_set1_pd((double)x);
+    __m128d acc = _mm_setzero_pd();
+    for (int m = 0; m < kModes; m += 2) {
+        __m128d bs = _mm_load_pd(&b.bs[m]);
+        __m128d a1 = _mm_load_pd(&b.a1[m]);
+        __m128d a2 = _mm_load_pd(&b.a2[m]);
+        __m128d y1 = _mm_load_pd(&b.y1[m]);
+        __m128d y2 = _mm_load_pd(&b.y2[m]);
+        __m128d y = _mm_sub_pd(_mm_add_pd(_mm_mul_pd(bs, xv), _mm_mul_pd(a1, y1)), _mm_mul_pd(a2, y2));
+        _mm_store_pd(&b.y2[m], y1);
+        _mm_store_pd(&b.y1[m], y);
+        acc = _mm_add_pd(acc, y);
+    }
+    double s[2];
+    _mm_storeu_pd(s, acc);
+    return static_cast<float>(s[0] + s[1]);
+#else
     double acc = 0.0;
     for (int m = 0; m < kModes; ++m) {
         const double y = b.bs[m] * x + b.a1[m] * b.y1[m] - b.a2[m] * b.y2[m];
@@ -399,6 +474,7 @@ float PhysicalSynth::bankSerial(Bank& b, float x) {
         acc += y;
     }
     return static_cast<float>(acc);
+#endif
 }
 
 double PhysicalSynth::ratioOf(int type, int m) {

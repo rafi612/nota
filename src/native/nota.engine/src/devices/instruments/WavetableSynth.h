@@ -279,11 +279,14 @@ class WavetableSynth final : public Instrument {
 
     const float* frame(int bank, int f) const { return tables_ + (size_t)((bank * kFrames) + f) * kTableSize; }
     // Wavetable position interpolation — pitch-critical, stays std::-exact.
+    // `phase` is always in [0, 1) here, so x is in [0, 2048): truncation toward
+    // zero is exactly floor for non-negative values (no std::floor call).
     static float readMorph(const float* t0, const float* t1, float ff, double phase) {
         const double x = phase * kTableSize;
-        int i0 = (int)x & (kTableSize - 1);
+        const int xi = (int)x;
+        int i0 = xi & (kTableSize - 1);
         int i1 = (i0 + 1) & (kTableSize - 1);
-        const float xf = (float)(x - std::floor(x));
+        const float xf = (float)(x - (double)xi);
         const float a = t0[i0] + (t0[i1] - t0[i0]) * xf;
         const float b = t1[i0] + (t1[i1] - t1[i0]) * xf;
         return a + (b - a) * ff;
@@ -352,6 +355,7 @@ class WavetableSynth final : public Instrument {
     const float* tables_ = nullptr; // shared, read-only (sharedTables)
     std::vector<float> chorusBuf_;
     int chorusW_ = 0;
+    int chorusMask_ = 4095; // power-of-two mask for chorusBuf_ (bitwise wrap, no modulo)
     float toneL_ = 0, toneR_ = 0;
     Comb revC_[kRevCombs];
     Allp revA_[kRevAll];

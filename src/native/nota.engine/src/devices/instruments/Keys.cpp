@@ -11,6 +11,7 @@
 
 #include "dsp/core/ScopedNoDenormals.h"
 #include "dsp/math/FastMath.h"
+#include "dsp/math/Simd.h"
 
 namespace nota {
 
@@ -377,8 +378,10 @@ void Keys::strike(Voice& v, float vel, bool fresh) {
             v.y2[m] = 0.0f;
         }
     }
-    if (!fresh) // a re-strike rebuilt the table — clear the modes it no longer has
-        for (int m = v.nModes; m < kMaxModes; ++m) { v.y1[m] = v.y2[m] = 0.0f; }
+    // Zero the padded tail (slots at/above nModes, including carried-over state on a
+    // fresh strike of a reused voice) so the 4-wide SIMD modal loop in renderVoice()
+    // reads exact zeros there — bit-transparent vs the scalar loop.
+    for (int m = v.nModes; m < kMaxModes; ++m) { v.a1[m] = v.a2[m] = v.b[m] = 0.0f; v.y1[m] = v.y2[m] = 0.0f; }
 
     v.model = model;
     v.vel = vel;
@@ -461,14 +464,62 @@ void Keys::renderVoice(Voice& v, float* mono, int n, int /*model*/, float sym, f
             exc = std::sin((v.pulsePos + 0.5f) * 2.0f * v.pulseK) * v.pulseK;
             ++v.pulsePos;
         }
-        // Modes → displacement.
+        // Modes → displacement. Four float modes per vector step (op order per lane
+        // matches the scalar loop exactly; only the final reduction order differs,
+        // residual < -90 dB). Slots at/above nModes are zeroed by strike().
         float x = 0.0f;
+#if defined(NOTA_SIMD_NEON)
+        {
+            const int mend = (v.nModes + 3) & ~3;
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            const float32x4_t excv = vdupq_n_f32(exc);
+            for (int m = 0; m < mend; m += 4) {
+                float32x4_t a1 = vld1q_f32(&v.a1[m]);
+                float32x4_t a2 = vld1q_f32(&v.a2[m]);
+                float32x4_t bb = vld1q_f32(&v.b[m]);
+                float32x4_t y1 = vld1q_f32(&v.y1[m]);
+                float32x4_t y2 = vld1q_f32(&v.y2[m]);
+                float32x4_t y =
+                    vaddq_f32(vsubq_f32(vmulq_f32(a1, y1), vmulq_f32(a2, y2)), vmulq_f32(bb, excv));
+                vst1q_f32(&v.y2[m], y1);
+                vst1q_f32(&v.y1[m], y);
+                acc = vaddq_f32(acc, y);
+            }
+#if defined(__aarch64__) || defined(_M_ARM64)
+            x = vaddvq_f32(acc);
+#else
+            float32x2_t s = vadd_f32(vget_high_f32(acc), vget_low_f32(acc));
+            x = vget_lane_f32(vpadd_f32(s, s), 0);
+#endif
+        }
+#elif defined(NOTA_SIMD_SSE)
+        {
+            const int mend = (v.nModes + 3) & ~3;
+            __m128 acc = _mm_setzero_ps();
+            const __m128 excv = _mm_set1_ps(exc);
+            for (int m = 0; m < mend; m += 4) {
+                __m128 a1 = _mm_load_ps(&v.a1[m]);
+                __m128 a2 = _mm_load_ps(&v.a2[m]);
+                __m128 bb = _mm_load_ps(&v.b[m]);
+                __m128 y1 = _mm_load_ps(&v.y1[m]);
+                __m128 y2 = _mm_load_ps(&v.y2[m]);
+                __m128 y = _mm_add_ps(_mm_sub_ps(_mm_mul_ps(a1, y1), _mm_mul_ps(a2, y2)), _mm_mul_ps(bb, excv));
+                _mm_store_ps(&v.y2[m], y1);
+                _mm_store_ps(&v.y1[m], y);
+                acc = _mm_add_ps(acc, y);
+            }
+            __m128 s = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
+            s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+            x = _mm_cvtss_f32(s);
+        }
+#else
         for (int m = 0; m < v.nModes; ++m) {
             const float y = v.a1[m] * v.y1[m] - v.a2[m] * v.y2[m] + v.b[m] * exc;
             v.y2[m] = v.y1[m];
             v.y1[m] = y;
             x += y;
         }
+#endif
         // Pickup.
         const float xd = std::clamp(x * v.drive * (1.0f + 0.6f * v.ex.pressure()), -1.6f, 1.6f);
         const float s = std::clamp(sym + v.symOff + 0.4f * v.ex.slide(), -1.5f, 1.5f);

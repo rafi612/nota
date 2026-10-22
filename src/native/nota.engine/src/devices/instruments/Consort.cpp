@@ -207,6 +207,7 @@ void Consort::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> Consort::clone() const {
@@ -271,6 +272,19 @@ void Consort::noteOff(int32_t pitch) {
 
 void Consort::render(float* out, int32_t frames) {
     dsp::ScopedNoDenormals noDenormals;
+    if (idle_ && !seqRun_) {
+        // A running sequencer blocks sleep (see below); while asleep the
+        // free-running LFO phase and transport clock advance in O(1) time.
+        // Tempo-synced LFO re-anchors to transport on wake via tFresh_.
+        const bool lfoSync = get(LfoSync) > 0.5f && tSpb_ > 1.0;
+        double inc = (double)lfoHzOf(get(LfoRate)) / sampleRate_;
+        if (lfoSync) inc = 1.0 / ((double)syncBeatsOf(get(LfoRate)) * tSpb_);
+        lfoPh_ += inc * frames;
+        lfoPh_ -= std::floor(lfoPh_);
+        tFrames_ += frames;
+        return;
+    }
+    if (idle_) idle_ = false; // sequencer started while asleep: resume rendering
     const auto t0 = std::chrono::steady_clock::now();
     const double pr = pendingRate_.load(std::memory_order_relaxed);
     if (pr != sampleRate_) { // voices keep playing; only rate-derived state restarts

@@ -5,6 +5,7 @@
 
 #include "Engine.h"
 #include "dsp/core/ScopedNoDenormals.h"
+#include "dsp/math/AudioBufferUtils.h"
 #include "dsp/math/SimdAudio.h"
 #include "devices/racks/DrumRack.h"
 #include "bridge/PluginHostBridge.h"
@@ -1798,26 +1799,9 @@ void Engine::processBlock(float* out, int32_t numFrames) {
     const float mv = masterVolume_.load(std::memory_order_relaxed);
     float mpkL = 0.0f, mpkR = 0.0f;
     double msqL = 0.0, msqR = 0.0, msLR = 0.0; // msLR: Stereo Map (specs/008)
-    for (int32_t i = 0; i < numFrames; ++i) {
-        // Master safety net: a NaN slips straight through std::clamp (every compare
-        // with NaN is false, so clamp returns it unchanged) and hits the speakers as
-        // full-scale noise. Squash any non-finite sample to silence *before* clamping
-        // so a single bad value from a device/feedback path can't blast the output.
-        float l = out[i * 2] * mv;
-        float r = out[i * 2 + 1] * mv;
-        if (!std::isfinite(l)) l = 0.0f;
-        if (!std::isfinite(r)) r = 0.0f;
-        l = std::clamp(l, -1.0f, 1.0f);
-        r = std::clamp(r, -1.0f, 1.0f);
-        out[i * 2] = l;
-        out[i * 2 + 1] = r;
-        const float al = std::fabs(l), ar = std::fabs(r);
-        if (al > mpkL) mpkL = al;
-        if (ar > mpkR) mpkR = ar;
-        msqL += l * (double)l;
-        msqR += r * (double)r;
-        msLR += l * (double)r;
-    }
+    // Single-pass SIMD: master gain, non-finite squash, hard clip and metering
+    // (NaN/Inf squash before clamp, exactly like the scalar loop it replaces).
+    processMasterBus(out, numFrames, mv, mpkL, mpkR, msqL, msqR, msLR);
     stereoFold(masterStereoL_, masterStereoR_, masterStereoLR_, msqL, msqR, msLR, numFrames,
         stereoBlockStep(numFrames, transport_.sampleRate()));
     masterPeakL_.store(mpkL, std::memory_order_relaxed);
@@ -2247,10 +2231,14 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
                     parWorkNs_ += (work - parWorkNs_) / 16;
                 } else {
                     // Just left the pool: one block over its period proves the bound wrong.
-                    // Rejoin at once and wait twice as long before the next try.
+                    // Rejoin at once and wait twice as long before the next try. Proactive:
+                    // engage before the first xrun once single-thread leaf work passes
+                    // 65% of the buffer period (needs 2+ eligible tracks and a block
+                    // worth parallelizing); the 1.0 bound still guards the probe.
                     const bool probeMissed = rtProbeLeftNs_ > 0 && (double)work > periodNs;
                     if (alone) leafWorkNs_ += (work - leafWorkNs_) / 16;
-                    if (probeMissed || (alone && leafWorkNs_ > periodNs)) {
+                    const bool proactive = alone && m >= 2 && frames >= 128 && leafWorkNs_ > kRtEngageLoad * periodNs;
+                    if (probeMissed || (alone && leafWorkNs_ > periodNs) || proactive) {
                         if (probeMissed) rtHoldNs_ = std::min(2 * rtHoldNs_, kRtMaxHoldSeconds * 1e9);
                         rtParallel_ = true;
                         rtParallelLeftNs_ = rtHoldNs_;
@@ -2317,27 +2305,36 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             double sqL = 0.0, sqR = 0.0, sLR = 0.0; // sLR: Stereo Map (specs/008)
             int64_t recDropped = 0;
             if (!ps.cross) {
-                // Static pan law: vectorized (exact per element), meters scalar.
-                // NOTE: dest/sends only when toMix (solo-gated feeders tap only).
+                // Static pan law: vectorized (exact per element). NOTE: dest/sends only
+                // when toMix (solo-gated feeders tap only). Meters ride the fused
+                // single-pass SIMD dest-add when this track isn't the resampling
+                // source; tapRec pushes must stay sample-ordered, so tapRec keeps
+                // the scalar loop (which also covers solo-gated meters, discarded below).
                 simd_audio::scaleStereo(mixTmp_.data(), post, ps.to.ll, ps.to.rr, frames);
                 const float* m = mixTmp_.data();
                 if (route && !w.postTapMuted) simd_audio::addStereoScaled(route, m, 1.0f, 1.0f, frames);
                 if (w.toMix) {
-                    simd_audio::addStereoScaled(dest, m, 1.0f, 1.0f, frames);
+                    if (!w.tapRec)
+                        addStereoScaledMeterMap(dest, m, frames, 1.0f, 1.0f, pkL, pkR, sqL, sqR, sLR);
+                    else
+                        simd_audio::addStereoScaled(dest, m, 1.0f, 1.0f, frames);
                     if (w.anySend)
                         for (int b = 0; b < numReturns; ++b)
                             if (w.sends[b] != 0.0f)
                                 simd_audio::addStereoScaled(returnBus_[b].data(), m, w.sends[b], w.sends[b], frames);
                 }
-                for (int32_t i = 0; i < frames; ++i) {
-                    const float l = m[i * 2], r = m[i * 2 + 1];
-                    if (w.tapRec && !inputQueue_.push(InputFrame{l, r})) ++recDropped; // record this track's output
-                    const float al = std::fabs(l), ar = std::fabs(r);
-                    if (al > pkL) pkL = al;
-                    if (ar > pkR) pkR = ar;
-                    sqL += l * (double)l;
-                    sqR += r * (double)r;
-                    sLR += l * (double)r;
+                if (w.tapRec || !w.toMix) {
+                    for (int32_t i = 0; i < frames; ++i) {
+                        const float l = m[i * 2], r = m[i * 2 + 1];
+                        if (w.tapRec && !inputQueue_.push(InputFrame{l, r}))
+                            ++recDropped; // record this track's output
+                        const float al = std::fabs(l), ar = std::fabs(r);
+                        if (al > pkL) pkL = al;
+                        if (ar > pkR) pkR = ar;
+                        sqL += l * (double)l;
+                        sqR += r * (double)r;
+                        sLR += l * (double)r;
+                    }
                 }
             } else {
                 for (int32_t i = 0; i < frames; ++i) {
@@ -2427,15 +2424,23 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
                 float pkL = 0.0f, pkR = 0.0f;
                 double sqL = 0.0, sqR = 0.0;
                 int64_t recDropped = 0;
-                // vectorized (exact per element); meters stay scalar.
-                simd_audio::scaleStereo(mixTmp_.data(), scratch_.data(), gl, gr, frames);
-                {
+                // Fused in-place scale + meters when not the resampling source; the
+                // tapRec path keeps the sample-ordered scalar loop (push + meters).
+                if (!tapRec) {
+                    double dummySLR = 0.0; // groups meter L/R only (no stereo fold)
+                    scaleStereoMeter(scratch_.data(), frames, gl, gr, pkL, pkR, sqL, sqR, dummySLR);
+                    const float* m = scratch_.data();
+                    simd_audio::addStereoScaled(dest, m, 1.0f, 1.0f, frames);
+                    if (route) simd_audio::addStereoScaled(route, m, 1.0f, 1.0f, frames);
+                } else {
+                    // vectorized (exact per element); meters stay scalar.
+                    simd_audio::scaleStereo(mixTmp_.data(), scratch_.data(), gl, gr, frames);
                     const float* m = mixTmp_.data();
                     simd_audio::addStereoScaled(dest, m, 1.0f, 1.0f, frames);
                     if (route) simd_audio::addStereoScaled(route, m, 1.0f, 1.0f, frames);
                     for (int32_t i = 0; i < frames; ++i) {
                         const float l = m[i * 2], r = m[i * 2 + 1];
-                        if (tapRec && !inputQueue_.push(InputFrame{l, r})) ++recDropped;
+                        if (!inputQueue_.push(InputFrame{l, r})) ++recDropped;
                         const float al = std::fabs(l), ar = std::fabs(r);
                         if (al > pkL) pkL = al;
                         if (ar > pkR) pkR = ar;
@@ -2499,17 +2504,23 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             if (!ps.cross) {
                 simd_audio::scaleStereo(mixTmp_.data(), scratch_.data(), ps.to.ll, ps.to.rr, frames);
                 const float* m = mixTmp_.data();
-                simd_audio::addStereoScaled(out, m, 1.0f, 1.0f, frames);
+                if (!tapRec)
+                    // Fused dest-add + meters; tapRec keeps the ordered scalar loop below.
+                    addStereoScaledMeterMap(out, m, frames, 1.0f, 1.0f, pkL, pkR, sqL, sqR, sLR);
+                else
+                    simd_audio::addStereoScaled(out, m, 1.0f, 1.0f, frames);
                 if (route) simd_audio::addStereoScaled(route, m, 1.0f, 1.0f, frames);
-                for (int32_t i = 0; i < frames; ++i) {
-                    const float l = m[i * 2], r = m[i * 2 + 1];
-                    if (tapRec && !inputQueue_.push(InputFrame{l, r})) ++recDropped;
-                    const float al = std::fabs(l), ar = std::fabs(r);
-                    if (al > pkL) pkL = al;
-                    if (ar > pkR) pkR = ar;
-                    sqL += l * (double)l;
-                    sqR += r * (double)r;
-                    sLR += l * (double)r;
+                if (tapRec) {
+                    for (int32_t i = 0; i < frames; ++i) {
+                        const float l = m[i * 2], r = m[i * 2 + 1];
+                        if (!inputQueue_.push(InputFrame{l, r})) ++recDropped;
+                        const float al = std::fabs(l), ar = std::fabs(r);
+                        if (al > pkL) pkL = al;
+                        if (ar > pkR) pkR = ar;
+                        sqL += l * (double)l;
+                        sqR += r * (double)r;
+                        sLR += l * (double)r;
+                    }
                 }
             } else {
                 for (int32_t i = 0; i < frames; ++i) {

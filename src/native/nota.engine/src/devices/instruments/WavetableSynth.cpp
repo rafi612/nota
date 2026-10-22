@@ -101,6 +101,7 @@ WavetableSynth::WavetableSynth() {
     set(FxReverbSize, 0.5f);
     tables_ = sharedTables();
     chorusBuf_.assign(4096, 0.0f);
+    chorusMask_ = 4095;
     for (auto& c : revC_) c.buf.assign(1, 0.0f);
 }
 
@@ -113,7 +114,14 @@ void WavetableSynth::controller(int32_t ctl, float value) {
 
 void WavetableSynth::setSampleRate(double sr) {
     sampleRate_ = sr > 0 ? sr : 44100.0;
-    chorusBuf_.assign((size_t)(sampleRate_ * 0.05) + 2, 0.0f);
+    // Power-of-two ring (bitwise wrap instead of modulo/division): 4096 at
+    // <= 48 kHz, 8192 at <= 96 kHz, 16384 at 192 kHz. Max tap depth (~14 ms)
+    // always fits, so a single conditional add wraps the read pointer.
+    size_t need = (size_t)(sampleRate_ * 0.05) + 4;
+    size_t pow2 = 1;
+    while (pow2 < need) pow2 <<= 1;
+    chorusBuf_.assign(pow2, 0.0f);
+    chorusMask_ = (int)pow2 - 1;
     chorusW_ = 0;
     static const int ct[kRevCombs] = {1116, 1188, 1277, 1356};
     for (int c = 0; c < kRevCombs; ++c) {
@@ -134,6 +142,7 @@ void WavetableSynth::setSampleRate(double sr) {
 void WavetableSynth::noteExpression(int32_t pitch, int32_t dim, float value) {
     if (pitch < 0) {
         gexpr_.set(dim, value);
+        wake();
         return;
     }
     float add[kExprDims];
@@ -241,6 +250,7 @@ void WavetableSynth::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> WavetableSynth::clone() const {
@@ -304,6 +314,24 @@ void WavetableSynth::allNotesOff() {
 }
 
 void WavetableSynth::render(float* out, int32_t frames) {
+    if (idle_) {
+        // Free-running clocks stay in phase while asleep (Keys precedent): LFO and
+        // chorus phases advance in O(1) time; S&H holds and filter states have
+        // converged during the hangover. The chorus write pointer advances through
+        // zeros — the hangover filled the taps with near-silence, so stale reads
+        // stay silent (verified by AuroraNullTests < -120 dB).
+        const double lfo1Inc = lfoInc(Lfo1Rate, Lfo1Sync);
+        const double lfo2Inc = lfoInc(Lfo2Rate, Lfo2Sync);
+        lfoPhase1_ += lfo1Inc * frames;
+        lfoPhase1_ -= std::floor(lfoPhase1_);
+        lfoPhase2_ += lfo2Inc * frames;
+        lfoPhase2_ -= std::floor(lfoPhase2_);
+        chorusPh_ += expMap(get(FxChorusRate), 0.1, 6.0) / sampleRate_ * frames;
+        chorusPh_ -= std::floor(chorusPh_);
+        const int sz = (int)chorusBuf_.size();
+        if (sz > 0) chorusW_ = (chorusW_ + frames) % sz;
+        return;
+    }
     // ---- macros first: seven of the twelve destinations ride the per-voice bus
     //      below, the other five move this block's snapshot ----
     double macroDst[kDests] = {0, 0, 0, 0, 0, 0, 0};
@@ -443,7 +471,26 @@ void WavetableSynth::render(float* out, int32_t frames) {
 
     const double invSr = 1.0 / sampleRate_;
 
+    // Silent fast path (US2): no voice is active at block start — none can start
+    // mid-block (note-ons split blocks in playEvents) — and both Chorus and Reverb
+    // tails are off, so the per-sample loop would accumulate exact silence. Advance
+    // the free-running LFO phases in O(1) and skip the loop. Chorus phase/pointer
+    // stay frozen (the old code only advances them inside chorus()), and the path
+    // additionally requires settled tone states so the residual stays < -120 dB.
+    int live0 = 0;
+    for (auto& v : voices_)
+        if (v.active) ++live0;
+    const bool silentFast = live0 == 0 && !(chorusOn && chAmt > 1e-4f) && !(reverbOn && rvAmt > 1e-4f) &&
+                            std::fabs(toneL_) <= 1e-7f && std::fabs(toneR_) <= 1e-7f;
+    if (silentFast) {
+        lfoPhase1_ += lfo1Inc * frames;
+        lfoPhase1_ -= std::floor(lfoPhase1_);
+        lfoPhase2_ += lfo2Inc * frames;
+        lfoPhase2_ -= std::floor(lfoPhase2_);
+    }
+
     float peak = 0.0f;
+    if (!silentFast) {
     for (int32_t i = 0; i < frames; ++i) {
         if (lfoPhase1_ >= 1.0) {
             lfoPhase1_ -= 1.0;
@@ -574,6 +621,7 @@ void WavetableSynth::render(float* out, int32_t frames) {
         out[i * 2] += al;
         out[i * 2 + 1] += ar;
     }
+    } // if (!silentFast)
 
     // Auto-sleep flag only (the engine skips render while idle): no voice sounding
     // and this block silent. noteOn/noteOff/setParam wake.
@@ -685,16 +733,62 @@ float WavetableSynth::oscStack(double* ph, double inc, int bank, float pos, int 
     const float ff = posF - f0;
     const float* t0 = frame(bank, f0);
     const float* t1 = frame(bank, f1);
+    // Warp mode is block-constant: dispatch once outside the unison loop instead of
+    // per voice per sample. Modes 0 (Off) and 4 (Fold) leave the read phase alone
+    // (Fold post-processes the output); the arithmetic in modes 1–3 is unchanged,
+    // only the block-constant factors are hoisted — bit-identical in all cases.
     float accL = 0.0f, accR = 0.0f;
-    for (int u = 0; u < uniN; ++u) {
-        double rp = warpRead(mode, ph[u], warpAmt);
-        float s = readMorph(t0, t1, ff, rp);
-        if (mode == 4) s = foldOut(s, warpAmt);
-        // Detune factors and equal-power gains are block-constant (see render()).
-        accL += s * panL[u];
-        accR += s * panR[u];
-        ph[u] += inc * detF[u];
-        if (ph[u] >= 1.0) ph[u] -= 1.0;
+    if (mode == 0) {
+        for (int u = 0; u < uniN; ++u) {
+            float s = readMorph(t0, t1, ff, ph[u]);
+            accL += s * panL[u];
+            accR += s * panR[u];
+            ph[u] += inc * detF[u];
+            if (ph[u] >= 1.0) ph[u] -= 1.0;
+        }
+    } else if (mode == 4) {
+        for (int u = 0; u < uniN; ++u) {
+            float s = foldOut(readMorph(t0, t1, ff, ph[u]), warpAmt);
+            accL += s * panL[u];
+            accR += s * panR[u];
+            ph[u] += inc * detF[u];
+            if (ph[u] >= 1.0) ph[u] -= 1.0;
+        }
+    } else if (mode == 1) {
+        const double m = 1.0 + warpAmt * 3.0;
+        for (int u = 0; u < uniN; ++u) {
+            double p = ph[u] * m;
+            double rp = p - std::floor(p);
+            float s = readMorph(t0, t1, ff, rp);
+            accL += s * panL[u];
+            accR += s * panR[u];
+            ph[u] += inc * detF[u];
+            if (ph[u] >= 1.0) ph[u] -= 1.0;
+        }
+    } else if (mode == 2) {
+        const double d = std::clamp(0.5 + (warpAmt - 0.5) * 0.9, 0.05, 0.95);
+        const double d1 = 1.0 - d;
+        for (int u = 0; u < uniN; ++u) {
+            double p = ph[u];
+            double rp = p < d ? 0.5 * p / d : 0.5 + 0.5 * (p - d) / d1;
+            float s = readMorph(t0, t1, ff, rp);
+            accL += s * panL[u];
+            accR += s * panR[u];
+            ph[u] += inc * detF[u];
+            if (ph[u] >= 1.0) ph[u] -= 1.0;
+        }
+    } else { // mode 3 (PWM-ish)
+        const double w = 0.05 + warpAmt * 0.9;
+        const double w1 = 1.0 - w;
+        for (int u = 0; u < uniN; ++u) {
+            double p = ph[u];
+            double rp = p < w ? 0.5 * p / w : 0.5 + 0.5 * (p - w) / w1;
+            float s = readMorph(t0, t1, ff, rp);
+            accL += s * panL[u];
+            accR += s * panR[u];
+            ph[u] += inc * detF[u];
+            if (ph[u] >= 1.0) ph[u] -= 1.0;
+        }
     }
     accL *= norm;
     accR *= norm;
@@ -789,33 +883,42 @@ void WavetableSynth::chorus(float l, float r, float amt, int voices, double rate
         outR = r;
         return;
     }
+    const int mask = chorusMask_;
     chorusBuf_[chorusW_] = (l + r) * 0.5f;
     chorusPh_ += rateHz / sampleRate_;
     if (chorusPh_ >= 1.0) chorusPh_ -= 1.0;
     // Delay-time LFO — REVERTED to std:: (measured ≈ −51 dB with fast_math::sin: a
     // 0.2-sample tap error on full-band wavetable content is audible in the null).
-    auto tap = [&](double phase) {
-        double d = (0.008 + 0.006 * std::sin(kTwoPi * (phase - std::floor(phase)))) * sampleRate_;
-        double rp = chorusW_ - d;
-        while (rp < 0) rp += sz;
+    // The 1, 2 or 4 taps sit at exact quarter-turn offsets of one LFO angle, so a
+    // single sin (plus cos for 4 taps) derives them all via {s,c,-s,-c}
+    // quarter-turn identities instead of one sin per tap per sample
+    const double s = std::sin(kTwoPi * chorusPh_);
+    auto tapS = [&](double sk) {
+        double d = (0.008 + 0.006 * sk) * sampleRate_;
+        double rp = (double)chorusW_ - d;
+        if (rp < 0) rp += sz; // max depth (~14 ms) always fits: single add wraps
         int i0 = (int)rp;
         float f = (float)(rp - i0);
-        if (i0 >= sz) i0 -= sz;
-        int i1 = (i0 + 1) % sz;
+        i0 &= mask;
+        int i1 = (i0 + 1) & mask;
         return chorusBuf_[i0] + (chorusBuf_[i1] - chorusBuf_[i0]) * f;
     };
     float a = 0.0f, b = 0.0f;
     // Taps sit evenly around the LFO cycle; odd ones go left, even ones right.
-    for (int k = 0; k < voices; ++k) {
-        float t = tap(chorusPh_ + (double)k / voices);
-        if (k % 2 == 0) a += t;
-        else
-            b += t;
+    if (voices == 1) {
+        a = tapS(s);
+    } else if (voices == 2) {
+        a = tapS(s);
+        b = tapS(-s);
+    } else { // voices == 4
+        const double c = std::cos(kTwoPi * chorusPh_);
+        a = tapS(s) + tapS(-s);
+        b = tapS(c) + tapS(-c);
     }
     const float na = 1.0f / std::max(1, (voices + 1) / 2), nb = voices > 1 ? 1.0f / (voices / 2) : 1.0f;
     a *= na;
     b = voices > 1 ? b * nb : a;
-    if (++chorusW_ >= sz) chorusW_ = 0;
+    chorusW_ = (chorusW_ + 1) & mask;
     outL = l * (1 - amt * 0.5f) + a * amt;
     outR = r * (1 - amt * 0.5f) + b * amt;
 }

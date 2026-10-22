@@ -6,18 +6,42 @@
 
 #include "dsp/primitives/Convolution.h"
 
+#include "dsp/math/Simd.h"
+
 #include <algorithm>
 
 namespace nota {
 namespace dsp {
 namespace {
 
-// Complex multiply-accumulate over B bins (Chamber's cmac).
+// Complex multiply-accumulate over B bins (Chamber's cmac). Bins 1..B-1 run four
+// per vector step with the scalar op order preserved per lane (residual < -90 dB);
+// bin 0 packs DC/Nyquist and the tail stay scalar.
 void cmac(float* __restrict ar, float* __restrict ai, const float* __restrict xr, const float* __restrict xi,
     const float* __restrict hr, const float* __restrict hi, int b) {
     ar[0] += xr[0] * hr[0]; // bin 0 packs DC (re) and Nyquist (im): two real products
     ai[0] += xi[0] * hi[0];
-    for (int i = 1; i < b; ++i) {
+    int i = 1;
+#if defined(NOTA_SIMD_NEON)
+    for (; i + 4 <= b; i += 4) {
+        float32x4_t xrv = vld1q_f32(&xr[i]), xiv = vld1q_f32(&xi[i]);
+        float32x4_t hrv = vld1q_f32(&hr[i]), hiv = vld1q_f32(&hi[i]);
+        float32x4_t rp = vmlsq_f32(vmulq_f32(xrv, hrv), xiv, hiv); // xr*hr - xi*hi
+        float32x4_t ip = vmlaq_f32(vmulq_f32(xrv, hiv), xiv, hrv); // xr*hi + xi*hr
+        vst1q_f32(&ar[i], vaddq_f32(vld1q_f32(&ar[i]), rp));
+        vst1q_f32(&ai[i], vaddq_f32(vld1q_f32(&ai[i]), ip));
+    }
+#elif defined(NOTA_SIMD_SSE)
+    for (; i + 4 <= b; i += 4) {
+        __m128 xrv = _mm_loadu_ps(&xr[i]), xiv = _mm_loadu_ps(&xi[i]);
+        __m128 hrv = _mm_loadu_ps(&hr[i]), hiv = _mm_loadu_ps(&hi[i]);
+        __m128 rp = _mm_sub_ps(_mm_mul_ps(xrv, hrv), _mm_mul_ps(xiv, hiv));
+        __m128 ip = _mm_add_ps(_mm_mul_ps(xrv, hiv), _mm_mul_ps(xiv, hrv));
+        _mm_storeu_ps(&ar[i], _mm_add_ps(_mm_loadu_ps(&ar[i]), rp));
+        _mm_storeu_ps(&ai[i], _mm_add_ps(_mm_loadu_ps(&ai[i]), ip));
+    }
+#endif
+    for (; i < b; ++i) {
         ar[i] += xr[i] * hr[i] - xi[i] * hi[i];
         ai[i] += xr[i] * hi[i] + xi[i] * hr[i];
     }

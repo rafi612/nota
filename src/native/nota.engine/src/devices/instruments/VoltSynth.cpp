@@ -10,6 +10,8 @@
 
 #include "dsp/math/FastMath.h"
 
+#include <unordered_map>
+
 namespace nota {
 
 VoltSynth::VoltSynth() {
@@ -111,6 +113,7 @@ void VoltSynth::controller(int32_t ctl, float value) {
 void VoltSynth::noteExpression(int32_t pitch, int32_t dim, float value) {
     if (pitch < 0) {
         gexpr_.set(dim, value);
+        wake();
         return;
     }
     float add[kExprDims];
@@ -178,9 +181,15 @@ std::string VoltSynth::pluginParamName(int32_t i) const {
 }
 
 int32_t VoltSynth::pluginParamIndexOfId(const std::string& id) const {
-    for (int32_t i = 0; i < kNumParams; ++i)
-        if (pluginParamId(i) == id) return i;
-    return -1;
+    // Built once: preset/automation apply looks up every parameter by id.
+    static const std::unordered_map<std::string, int32_t> map = [this] {
+        std::unordered_map<std::string, int32_t> m;
+        m.reserve(kNumParams * 2);
+        for (int32_t i = 0; i < kNumParams; ++i) m.emplace(pluginParamId(i), i);
+        return m;
+    }();
+    auto it = map.find(id);
+    return it == map.end() ? -1 : it->second;
 }
 
 std::vector<uint8_t> VoltSynth::getState() const {
@@ -200,6 +209,7 @@ void VoltSynth::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> VoltSynth::clone() const {
@@ -277,6 +287,29 @@ void VoltSynth::noteOff(int32_t pitch) {
 }
 
 void VoltSynth::render(float* out, int32_t frames) {
+    if (idle_) {
+        // Free-running LFO/vibrato phases advance in O(1) time (Keys precedent).
+        // S&H holds and filter states converged during the hangover; params are
+        // frozen while asleep (pluginParamSet wakes), so block-rate increments hold.
+        double mb4 = 0.0, mb5 = 0.0;
+        for (int m = 0; m < kMacros; ++m) {
+            const double x = get((Param)macroIdx(m, 0)) * (get((Param)macroIdx(m, 2)) - 0.5) * 2.0;
+            if (std::fabs(x) <= 1e-4) continue;
+            const int d = macroDestOf(get((Param)macroIdx(m, 1)));
+            if (d == 8) mb4 += x;
+            else if (d == 10)
+                mb5 += x;
+        }
+        const double lfo1Inc = this->lfoInc(Lfo1Rate, Lfo1Sync) * fast_math::exp2f((float)(mb4 * 2.0));
+        const double lfo2Inc = this->lfoInc(Lfo2Rate, Lfo2Sync) * fast_math::exp2f((float)(mb5 * 2.0));
+        lfoPhase1_ += lfo1Inc * frames;
+        lfoPhase1_ -= std::floor(lfoPhase1_);
+        lfoPhase2_ += lfo2Inc * frames;
+        lfoPhase2_ -= std::floor(lfoPhase2_);
+        vibPhase_ += expMap(get(VibRate), 0.1, 12.0) / sampleRate_ * frames;
+        vibPhase_ -= std::floor(vibPhase_);
+        return;
+    }
     // ---- macros first: six of the twelve destinations move the block snapshot
     //      below (levels, Filter 2, LFO rates), the other six ride the voice bus ----
     double macroDst[kDests] = {0, 0, 0, 0, 0, 0};

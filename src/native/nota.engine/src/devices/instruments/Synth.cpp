@@ -35,6 +35,7 @@ Synth::Synth() {
 void Synth::noteExpression(int32_t pitch, int32_t dim, float value) {
     if (pitch < 0) {
         gexpr_.set(dim, value);
+        wake();
         return;
     }
     float add[kExprDims];
@@ -80,6 +81,7 @@ void Synth::setState(const uint8_t* data, int32_t size) {
         std::memcpy(&v, data + i * sizeof(float), sizeof(float));
         if (std::isfinite(v)) pn_[i].store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
     }
+    wake();
 }
 
 std::shared_ptr<Instrument> Synth::clone() const {
@@ -142,6 +144,7 @@ void Synth::noteOff(int32_t pitch) {
 }
 
 void Synth::render(float* out, int32_t frames) {
+    if (idle_) return; // no free-running global clocks; voices are the only state
     // Snapshot params once per block (denormalise to musical units).
     const int wave = static_cast<int>(std::lround(pn_[Wave].load(std::memory_order_relaxed) * 3.0f));
     const float atkRate = static_cast<float>(1.0 / (secOf(Attack, 0.001, 2.0) * sampleRate_));
