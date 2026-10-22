@@ -49,9 +49,9 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Independent Test**: `mix-16/32` faster; peaks identical; smoke green.
 
-- [ ] T006 [US2] Unity-gain fast path in `processMasterBus` (`mv == 1.0f` exact: skip multiply, keep squash+clip+meter) in `src/native/nota.engine/src/dsp/math/AudioBufferUtils.h`. (Clip-gating dropped: clip is 2 min/max per vector vs a full extra pre-scan pass. Leaf unity-scale dropped: Balance centre is 0.7071, never 1.0 — verified in `panGains`, `Engine_Render.cpp:34-42`.)
-- [ ] T007 [US2] Skip per-block zero-fill of pruned group/return buses: move `groupBus_`/`returnBus_` `fill_n` after the US1 prune marking in `src/native/nota.engine/src/engine/Engine_Render.cpp` and fill only audible buses (pruned buses are never read — both passes skip before reading)
-- [ ] T008 [US2] Verify: `mix-16`, `mix-32`, meter tests, null `< -120 dB` (depends on T006–T007)
+- [x] T006 [US2] Unity-gain fast path in `processMasterBus` (`mv == 1.0f` exact: skip multiply via `processMasterBusImpl<Unity>` + `if constexpr`, keep squash+clip+meter) in `src/native/nota.engine/src/dsp/math/AudioBufferUtils.h`. (Clip-gating dropped: clip is 2 min/max per vector vs a full extra pre-scan pass. Leaf unity-scale dropped: Balance centre is 0.7071, never 1.0 — verified in `panGains`, `Engine_Render.cpp:34-42`.)
+- [x] T007 [US2] Skip per-block zero-fill of pruned group/return buses: `fill_n` moved after the US1 prune marking; mute+prune merged into single `grpSkip`/`retSkip` predicates shared by fills and passes in `src/native/nota.engine/src/engine/Engine_Render.cpp` (keep `tapRec`/frozen on slow path)
+- [x] T008 [US2] Verify: cooled interleaved A/B mix-16 ±0.1%, mix-16-g −0.3–0.5% (≈neutral, kept as no-risk hygiene); null −240 dB; full `build.sh` green exit 0 / 3997 PASS (depends on T006–T007)
 
 ---
 

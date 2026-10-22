@@ -1972,8 +1972,8 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             if (t->type() == TrackType::Return) ++numReturns;
         }
         if (numReturns > kMaxReturns) numReturns = kMaxReturns;
-        for (int b = 0; b < numReturns; ++b) // clear send buses for this block (M6-1)
-            std::fill_n(returnBus_[b].data(), frames * 2, 0.0f);
+        // Send/return and group buses are zeroed after the US1 prune marking below
+        // (only buses that can carry signal this block are cleared).
         // Phase B/D: clear this block's route-write buffers (post + pre) for active slots.
         for (int s = 0; s < kMaxRoutes; ++s)
             if (routeSlotTrackId_[s].load(std::memory_order_relaxed) >= 0) {
@@ -2017,7 +2017,7 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             grpDepth[i] = depth;
             if (depth > maxDepth) maxDepth = depth;
         }
-        for (int i = 0; i < numGroups; ++i) std::fill_n(groupBus_[i].data(), frames * 2, 0.0f);
+        // Group buses are zeroed after the US1 prune marking below (audible only).
         // A leaf's effective mute/solo folds in any ancestor group's flag.
         auto leafMute = [&](Track& t) {
             if (t.mute()) return true;
@@ -2197,6 +2197,32 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
                 const int p = slotOf(grpParent[gi]);
                 if (p >= 0) grpAud[(size_t)p] = true;
             }
+        // Merged skip predicates (US1+US2): one decision per group/return shared
+        // by the bus zero-fill below and the DSP passes. A muted bus skips; an
+        // unmuted bus skips only when it carries no signal (pruned) and its own
+        // chain is settled (devices idle, PDC passthrough) — bit-identical since
+        // every skipped buffer stays zeroed and every tap-add would add zeros to
+        // per-block-cleared route buses.
+        bool grpSkip[kMaxGroups] = {};
+        for (int gi = 0; gi < numGroups; ++gi)
+            grpSkip[gi] = grpMuteE[gi] ||
+                          (!grpAud[gi] && devicesIdle(*grpT[gi]) && (!grpT[gi]->pdc || grpT[gi]->pdc->isIdle()));
+        bool retSkip[kMaxReturns] = {};
+        for (auto& tptr : g->tracks) {
+            Track& t = *tptr;
+            if (t.type() != TrackType::Return) continue;
+            const int32_t bus = t.returnIndex();
+            if (bus < 0 || bus >= kMaxReturns) continue;
+            if (bus >= numReturns || t.mute()) {
+                retSkip[bus] = true;
+                continue;
+            }
+            retSkip[bus] = !retAud[bus] && devicesIdle(t) && (!t.pdc || t.pdc->isIdle());
+        }
+        for (int b = 0; b < numReturns; ++b) // clear audible send buses for this block
+            if (!retSkip[b]) std::fill_n(returnBus_[b].data(), frames * 2, 0.0f);
+        for (int gi = 0; gi < numGroups; ++gi) // clear audible group buses for this block
+            if (!grpSkip[gi]) std::fill_n(groupBus_[gi].data(), frames * 2, 0.0f);
 
         // Parallel DSP phase: eligible leaves render dry into their own
         // rs_->leafBuf region, copy to the post half, run devices in place
@@ -2411,15 +2437,7 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             for (int gi = 0; gi < numGroups; ++gi) {
                 if (grpDepth[gi] != depth) continue;
                 Track& t = *grpT[gi];
-                if (grpMuteE[gi]) {
-                    t.setMeter(0, 0, 0, 0);
-                    continue;
-                } // muted group (or muted ancestor)
-                // Pruned group (US1): no audible contributor in its subtree and
-                // its own chain is settled (devices idle, PDC passthrough), so the
-                // bus holds zeros and every tap-add below would add zeros to
-                // per-block-cleared buffers. Skip bit-identically.
-                if (!grpAud[gi] && devicesIdle(t) && (!t.pdc || t.pdc->isIdle())) {
+                if (grpSkip[gi]) {
                     t.setMeter(0, 0, 0, 0);
                     continue;
                 }
@@ -2500,16 +2518,7 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             Track& t = *tptr;
             if (t.type() != TrackType::Return) continue;
             const int32_t bus = t.returnIndex();
-            if (bus < 0 || bus >= numReturns || t.mute()) {
-                t.setMeter(0, 0, 0, 0);
-                t.stereoFold(0, 0, 0, frames, stereoA);
-                continue;
-            }
-            // Pruned return (US1): no audible send into this bus and the chain
-            // is settled (devices idle, PDC passthrough) — the bus holds zeros
-            // (cleared per block), so processing would render silence. Tails ring
-            // out through the non-idle path exactly as before.
-            if (!retAud[bus] && devicesIdle(t) && (!t.pdc || t.pdc->isIdle())) {
+            if (bus < 0 || bus >= numReturns || retSkip[bus]) {
                 t.setMeter(0, 0, 0, 0);
                 t.stereoFold(0, 0, 0, frames, stereoA);
                 continue;

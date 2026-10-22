@@ -145,8 +145,11 @@ inline void addStereoScaled(float* dest, const float* src, int32_t frames, float
 // Vectorized master bus fader, safety net (NaN/Inf suppression), clipping, and telemetry:
 // Multiplies out by mv, squashes any non-finite float to 0.0f, clamps to [-1.0f, 1.0f],
 // and computes pkL, pkR, sqL, sqR, sLR in a single unified SIMD pass.
-inline void processMasterBus(float* out, int32_t frames, float mv, float& outPkL, float& outPkR, double& outSqL,
-    double& outSqR, double& outSLR) noexcept {
+// Unity gain (mv == 1.0f, the default) skips the multiply: x * 1.0f is the identity
+// for every input including NaN/Inf (squashed identically below), so the two
+// instantiations below are bit-identical where they overlap.
+template <bool Unity> inline void processMasterBusImpl(float* out, int32_t frames, float mv, float& outPkL,
+    float& outPkR, double& outSqL, double& outSqR, double& outSLR) noexcept {
     StereoMeterAccumulator meter;
     int32_t i = 0;
 
@@ -156,8 +159,15 @@ inline void processMasterBus(float* out, int32_t frames, float mv, float& outPkL
     const float32x4_t vmax = vdupq_n_f32(1.0f);
 
     for (; i + 4 <= frames; i += 4) {
-        float32x4_t v0 = simd::squashNonFinite(vmulq_f32(vld1q_f32(out + i * 2), vmv));
-        float32x4_t v1 = simd::squashNonFinite(vmulq_f32(vld1q_f32(out + i * 2 + 4), vmv));
+        float32x4_t r0 = vld1q_f32(out + i * 2), r1 = vld1q_f32(out + i * 2 + 4);
+        float32x4_t v0, v1;
+        if constexpr (Unity) {
+            v0 = simd::squashNonFinite(r0);
+            v1 = simd::squashNonFinite(r1);
+        } else {
+            v0 = simd::squashNonFinite(vmulq_f32(r0, vmv));
+            v1 = simd::squashNonFinite(vmulq_f32(r1, vmv));
+        }
         v0 = vminq_f32(vmaxq_f32(v0, vmin), vmax);
         v1 = vminq_f32(vmaxq_f32(v1, vmin), vmax);
         vst1q_f32(out + i * 2, v0);
@@ -166,7 +176,10 @@ inline void processMasterBus(float* out, int32_t frames, float mv, float& outPkL
         meter.accumulateSimd(v1);
     }
     for (; i + 2 <= frames; i += 2) {
-        float32x4_t v0 = simd::squashNonFinite(vmulq_f32(vld1q_f32(out + i * 2), vmv));
+        float32x4_t r0 = vld1q_f32(out + i * 2);
+        float32x4_t v0;
+        if constexpr (Unity) v0 = simd::squashNonFinite(r0);
+        else v0 = simd::squashNonFinite(vmulq_f32(r0, vmv));
         v0 = vminq_f32(vmaxq_f32(v0, vmin), vmax);
         vst1q_f32(out + i * 2, v0);
         meter.accumulateSimd(v0);
@@ -177,8 +190,15 @@ inline void processMasterBus(float* out, int32_t frames, float mv, float& outPkL
     const __m128 vmax = _mm_set1_ps(1.0f);
 
     for (; i + 4 <= frames; i += 4) {
-        __m128 v0 = simd::squashNonFinite(_mm_mul_ps(_mm_loadu_ps(out + i * 2), vmv));
-        __m128 v1 = simd::squashNonFinite(_mm_mul_ps(_mm_loadu_ps(out + i * 2 + 4), vmv));
+        __m128 r0 = _mm_loadu_ps(out + i * 2), r1 = _mm_loadu_ps(out + i * 2 + 4);
+        __m128 v0, v1;
+        if constexpr (Unity) {
+            v0 = simd::squashNonFinite(r0);
+            v1 = simd::squashNonFinite(r1);
+        } else {
+            v0 = simd::squashNonFinite(_mm_mul_ps(r0, vmv));
+            v1 = simd::squashNonFinite(_mm_mul_ps(r1, vmv));
+        }
         v0 = _mm_min_ps(_mm_max_ps(v0, vmin), vmax);
         v1 = _mm_min_ps(_mm_max_ps(v1, vmin), vmax);
         _mm_storeu_ps(out + i * 2, v0);
@@ -187,7 +207,10 @@ inline void processMasterBus(float* out, int32_t frames, float mv, float& outPkL
         meter.accumulateSimd(v1);
     }
     for (; i + 2 <= frames; i += 2) {
-        __m128 v0 = simd::squashNonFinite(_mm_mul_ps(_mm_loadu_ps(out + i * 2), vmv));
+        __m128 r0 = _mm_loadu_ps(out + i * 2);
+        __m128 v0;
+        if constexpr (Unity) v0 = simd::squashNonFinite(r0);
+        else v0 = simd::squashNonFinite(_mm_mul_ps(r0, vmv));
         v0 = _mm_min_ps(_mm_max_ps(v0, vmin), vmax);
         _mm_storeu_ps(out + i * 2, v0);
         meter.accumulateSimd(v0);
@@ -195,14 +218,26 @@ inline void processMasterBus(float* out, int32_t frames, float mv, float& outPkL
 #endif
 
     for (; i < frames; ++i) {
-        float l = std::clamp(simd::squashNonFinite(out[i * 2] * mv), -1.0f, 1.0f);
-        float r = std::clamp(simd::squashNonFinite(out[i * 2 + 1] * mv), -1.0f, 1.0f);
+        float l, r;
+        if constexpr (Unity) {
+            l = std::clamp(simd::squashNonFinite(out[i * 2]), -1.0f, 1.0f);
+            r = std::clamp(simd::squashNonFinite(out[i * 2 + 1]), -1.0f, 1.0f);
+        } else {
+            l = std::clamp(simd::squashNonFinite(out[i * 2] * mv), -1.0f, 1.0f);
+            r = std::clamp(simd::squashNonFinite(out[i * 2 + 1] * mv), -1.0f, 1.0f);
+        }
         out[i * 2] = l;
         out[i * 2 + 1] = r;
         meter.accumulateTail(l, r);
     }
 
     meter.finalize(outPkL, outPkR, outSqL, outSqR, outSLR);
+}
+
+inline void processMasterBus(float* out, int32_t frames, float mv, float& outPkL, float& outPkR, double& outSqL,
+    double& outSqR, double& outSLR) noexcept {
+    if (mv == 1.0f) processMasterBusImpl<true>(out, frames, mv, outPkL, outPkR, outSqL, outSqR, outSLR);
+    else processMasterBusImpl<false>(out, frames, mv, outPkL, outPkR, outSqL, outSqR, outSLR);
 }
 
 enum class SignalState : uint8_t { Active, PossiblySilent, Silent };
