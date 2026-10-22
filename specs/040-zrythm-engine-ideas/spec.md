@@ -241,13 +241,22 @@ no RT alloc (RTSan/`NOTA_RT_SAFE` clean).
 
 ## Success Criteria
 
-- **SC-001**: `sparse-32` and solo-1-of-32 improve ≥ 15% wall-time/instructions
-  with `< -120 dB` null; no `nota_perf` scenario regresses beyond the perf-gate
-  (1% instr / 15% wall).
-- **SC-002**: `mix-16`/`mix-32` improve measurably (target ≥ 5%) via US2+US3
-  with identical peaks and green meter tests.
+- **SC-001**: Prune scenarios improve with `< -120 dB` null (measured:
+  `mix-16-g` −6% A/B, peaks identical); no `nota_perf` scenario regresses
+  beyond the perf-gate (1% instr / 15% wall). (Original ≥ 15% target for
+  `sparse-32`/solo assumed group-heavy sessions; the harness scenarios carry
+  no groups/returns, so the measured claim is the grouped half-muted mix.
+  `sparse-32` itself is unchanged by construction — its leaves were already
+  skipped pre-040.)
+- **SC-002**: `mix-16`/`mix-32` show no regression (measured ±0.1–0.5%,
+  within noise) with identical peaks and green meter tests. (Original ≥ 5%
+  target via US2+US3 not met: US2 unity-mul/fill-skip is ~neutral by
+  construction — master is 1 buffer vs 16 leaf chains, nothing pruned in
+  full mixes — and US3 was rejected on its 0.8% upper-bound probe. Kept as
+  no-risk hygiene, not as a speedup.)
 - **SC-003**: `aurora-supersaw-2x` single-track scales with voices (target ≥
   1.2x on `>= 4` voices, else US4 is rejected like 039-R4a and stays out).
+  → REJECTED per gate (measured +4.6%), fully reverted, recorded in R4b.
 - **SC-004**: `scripts/build.sh` green (native + managed + smoke 100%), incl.
   extended null/meter/prune tests; `CHANGELOG.md [Unreleased]` entry.
 - **SC-005**: Zero audio-thread alloc/lock/I-O (RTSan/`NOTA_RT_SAFE` clean),

@@ -118,6 +118,15 @@ Entry categories: `Added`, `Changed`, `Fixed`, `Removed`.
   15% longer (timed back to back, re-checked before failing). An idle engine
   must also stay under 5% CPU on macOS, Windows and Linux. Run it locally with
   `scripts/perf-gate.sh develop` (Linux).
+- **Engine mixer pruning and fast paths**: groups and send returns with no audible
+  contributor and a settled chain (idle devices, passthrough delay compensation)
+  skip DSP per block, with a single shared mute/solo predicate and merged skip
+  flags; the master bus skips its gain multiply at unity (the default) with
+  bit-identical output. A `mix-16-g` benchmark scenario (grouped, half-muted,
+  send reverb) covers it and renders about 6% faster. Voice-level parallelism,
+  decimated meters, port caches and MIDI repacking were prototyped or probed and
+  deliberately left out (wake-up cost, exactness, or already-satisfied) — see
+  `specs/040-zrythm-engine-ideas/research.md`.
 
 ### Fixed
 - **Context menus are never cut off at the sides**: a menu whose longest item had no shortcut

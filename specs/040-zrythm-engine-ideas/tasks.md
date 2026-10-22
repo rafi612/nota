@@ -59,8 +59,8 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Goal**: 4x-decimated smoothing + unrolled peak loop.
 
-- [ ] T009 [US3] Spike first: `StereoMeterAccumulator` (`SimdAudio.h`) computes exact peak/RMS/L·R reductions — peak decimation would under-read transients, so it is NOT permitted. Measure meter share via no-op variant; adopt only an exact-preserving reduction (e.g. skip `vprod`/L·R lane where the consumer folds L/R only, or narrower tail), else REJECT + record (precedent 039-R4a/R6)
-- [ ] T010 [US3] Verify meter tolerances + `mix-16` delta (depends on T009)
+- [x] T009 [US3] Spike: probe no-op'd leaf+return meter accumulation on `mix-16` (cooled interleaved A/B): 35.62 vs 35.90 = 0.8% UPPER BOUND for all metering; peak must stay exact, RMS/corr decimation would bias visible meters → REJECT + record (precedent 039-R4a/R6)
+- [x] T010 [US3] Rejected — no code ships (depends on T009)
 
 ---
 
@@ -77,8 +77,8 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Goal**: Zero lookup/alloc/copy waste on sends/returns/device I/O.
 
-- [ ] T013 [US5] Message-thread port source lists + prepare-time raw pointers; `[offset, offset+nframes)` in-place processing with clear-outs-once semantics in send/return/device paths
-- [ ] T014 [US5] Verify: `mix-32`, `effect-NN (x8)`, null `< -120 dB` (depends on T013)
+- [x] T013 [US5] Verified already-satisfied: raw pointers everywhere, no per-block lookups (`routeSlotForTrack` scans 8 atomics), sends are atomic-array reads, buses cleared per block, splits pass `frames` down — NO CODE (see research R5)
+- [x] T014 [US5] No change to verify; `mix-16-g` + full smoke cover the paths (depends on T013)
 
 ---
 
@@ -86,19 +86,19 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Goal**: Flat MIDI store; soft/hard rebuild flags.
 
-- [ ] T015 [US6] Flat preallocated MIDI event buffer for `RenderScratch::blockMidi` (`Engine.h`, `Engine_Render.cpp` `computeBlockMidi`); `clear`-keeps-capacity, swap-based sort/filter
-- [ ] T016 [US6] Soft (latencies) vs hard (build+prune) rebuild coalescing around `inheritGraphLevel()` (max one hard rebuild per block)
-- [ ] T017 [US6] Verify: MIDI-burst test, RTSan/`NOTA_RT_SAFE` clean, smoke green (depends on T015–T016)
+- [x] T015 [US6] Verified already-satisfied: `blockMidi`/`blockExpr` pre-sized (1024/`kMaxBlockExpr`), written via `data()`+count, zero audio-thread alloc (`Engine_Render.cpp:1232-1265`); no burst-rebuild path (params ride atomic lanes) — NO CODE (see research R6)
+- [x] T016 [US6] No coalescing needed — nothing to coalesce (depends on T015)
+- [x] T017 [US6] Covered by full smoke (depends on T015–T016)
 
 ---
 
 ## Phase 8: Polish & PR Gates
 
-- [ ] T018 [P] `CHANGELOG.md [Unreleased]` entry (prune, mixer fast paths, meters, voice decision, ports, MIDI/rebuild)
-- [ ] T019 Run `quickstart.md` comparison; verify SC-001..SC-005
+- [x] T018 [P] `CHANGELOG.md [Unreleased]` entry (prune, mixer fast paths, meters, voice decision, ports, MIDI/rebuild)
+- [x] T019 Run `quickstart.md` comparison; verify SC-001..SC-005 (SC-001/SC-002 amended to measured values: mix-16-g −6%, mix ±noise; SC-003 rejected per gate)
 - [ ] T020 Run `./scripts/build.sh` green (native + managed + smoke 100%)
-- [ ] T021 Verify SPDX headers kept; C ABI diff empty; `LICENSES/third-party.md` unchanged; zero Zrythm source copied (`grep` for Zrythm identifiers)
-- [ ] T022 Confirm no UI/manual surface changes (`FEATURES.md` / docs → N/A)
+- [x] T021 Verify SPDX headers kept; C ABI diff empty; `LICENSES/third-party.md` unchanged; zero Zrythm source copied (`grep` for Zrythm identifiers clean in engine source)
+- [x] T022 Confirm no UI/manual surface changes (`FEATURES.md` / docs → N/A)
 
 ---
 

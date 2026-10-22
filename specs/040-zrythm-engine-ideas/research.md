@@ -25,13 +25,23 @@ Nothing below is copied; file:line refs are provenance for the idea only.
   1:1 copy-without-clear (`audio_bus_channel_routing.cpp:48-76`,
   `cv_port.cpp:53-87` analogues).
 
-## R3: Decimated meters — ADOPT (US3)
+## R3: Decimated meters — PROBED, REJECTED (US3)
 
 - Zrythm `kmeter_dsp.cpp:38-96`, `peak_dsp.cpp:50-103`: x4 unroll, smoothing
-  filter every 4th sample, `+1e-20f/+1e-10f` anti-denormal bias.
-- Nota keeps `ScopedNoDenormals`; add decimation to `StereoMeterAccumulator`
-  (`SimdAudio.h`) with smoke-tolerance check. No `isfinite` on RT (Zrythm
-  `-ffast-math` lesson, `CMakeLists.txt:495-521` + AGENTS.md:313).
+  filter every 4th sample, `+1e-20f/+1e-10f` anti-denormal bias. That decimates
+  a ballistics FILTER, not peak detection.
+- Nota's `StereoMeterAccumulator` (`SimdAudio.h`) computes exact peak / RMS /
+  L·R reductions — decimating peak would under-read transients, and decimating
+  RMS/correlation biases user-visible meters. No `isfinite` on RT regardless
+  (Zrythm `-ffast-math` lesson, `CMakeLists.txt:495-521` + AGENTS.md:313).
+- Probe (2026-10-22): no-op'd all leaf+return meter accumulation
+  (`addStereoScaledMeterMap` → plain `addStereoScaled`, meters zeroed) on
+  `mix-16`, cooled interleaved A/B: 35.62 vs 35.90 (**0.8%** upper bound for
+  ALL leaf/return metering). Any exact-preserving subset (e.g. skipping the
+  `vprod` lane where `dummySLR` is passed, `Engine_Render.cpp:2488`) is a
+  fraction of that on group buffers only — immeasurable, and decimation would
+  degrade a visible surface for ~0.3%.
+- Decision: REJECTED. Meter accumulation stays exact and fused.
 
 ## R4: Voice parallelism with thresholds — GATED SPIKE (US4)
 
@@ -69,21 +79,34 @@ Nothing below is copied; file:line refs are provenance for the idea only.
   needs zero-wake dispatch or coarser shards with a different wake-up story,
   not a different loop shape.
 
-## R5: Port source cache + subspans — ADOPT (US5)
+## R5: Port source cache + subspans — ALREADY SATISFIED, no change (US5)
 
 - Zrythm `port.h:202-257` (`set_port_sources` on message thread),
   `processor_base.cpp:87-216` (raw `live_in/live_out`, clamp
   `offset+nframes <= max_block`, clear-outs-once/clear-ins-after).
-- Transfer to send/return/device paths; sub-block splits (loop seam,
-  count-in) touch only `[offset, offset+nframes)`.
+- Verified: Nota already does the equivalent — raw bus/device pointers
+  (`leafBase`, `groupBus_`, `routeBus_`), no per-block map lookups anywhere;
+  the only scan is `routeSlotForTrack` (`Engine.h:1902-1906`, linear over
+  `kMaxRoutes=8` atomics, ~6 calls/leaf/block ≈ 1 µs total); sends are direct
+  atomic-array reads (`Track.h:200-204`); buses cleared per block; sub-block
+  splits (loop seam, count-in) already pass split `frames` down (no
+  offset+nframes plumbing needed). Hoisting `routeSlotForTrack` into
+  `LeafWork` would save ~1000 atomic loads/block — immeasurable, declined.
+- Decision: NO CODE. The pattern matches; nothing to port.
 
-## R6: Packed MIDI + soft/hard recalc — ADOPT (US6)
+## R6: Packed MIDI + soft/hard recalc — ALREADY SATISFIED, no change (US6)
 
 - Zrythm `midi_event_buffer.h:55-209` (packed layout, `reserve()` once,
   swap-based sort/filter), `graph_dispatcher.h:44-63` (soft=latencies,
   hard=build+prune, re-entrant deferred).
-- Transfer: flat buffer for `RenderScratch::blockMidi` (`Engine.h:1767-1776`);
-  soft/hard flags around `inheritGraphLevel()` (`Graph.cpp:8-15`).
+- Verified: `RenderScratch::blockMidi/blockExpr` inner buffers are pre-sized
+  (1024/`kMaxBlockExpr`) at publish and written via `buf.data()` + count —
+  zero audio-thread allocation by construction (`Engine_Render.cpp:1232-1265`
+  AR-6 comment). Packing would only touch control-path locality: immeasurable.
+  Rebuild coalescing has no trigger in Nota's architecture: structural edits
+  publish snapshots (already minimal), automation/params ride atomic lanes
+  without rebuilds.
+- Decision: NO CODE. Substance already present; no burst-rebuild path exists.
 
 ## R7: Deliberately NOT ported
 
