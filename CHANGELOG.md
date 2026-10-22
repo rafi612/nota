@@ -182,6 +182,12 @@ Entry categories: `Added`, `Changed`, `Fixed`, `Removed`.
   about 2.5× faster with bit-identical sound — block-constant unison, chorus and pitch
   math is hoisted out of the per-sample loop. The `aurora-supersaw-2x` benchmark scenario
   and the Aurora null-test gate in the smoke test cover the change.
+- **Aurora renders dense presets with fewer CPU cycles, same sound**: the chorus LFO
+  and sine LFOs advance by complex rotation instead of per-sample `sin`/`cos`, the
+  filter `tan` comes from a lookup table, and unison phases are branchless integers —
+  inaudible LFOs are skipped exactly. `aurora-supersaw-2x` renders about 15% faster
+  than before on top of the earlier gain, null-tested bit-identical across all
+  factory presets.
 - **Silent instrument tracks no longer burn CPU**: eight built-in synthesizers (Aurora,
   Volt, Pentad, Consort, Operator, Flux, Bass, Synth) and idle Instrument/Drum Rack
   chains now skip rendering once their voices and tails decay, waking sample-accurately

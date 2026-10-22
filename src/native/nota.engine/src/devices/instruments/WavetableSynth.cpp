@@ -100,6 +100,7 @@ WavetableSynth::WavetableSynth() {
     set(FxReverbMode, 0.0f);
     set(FxReverbSize, 0.5f);
     tables_ = sharedTables();
+    tanTable(); // build the process-static tan LUT now (UI thread), never on audio
     chorusBuf_.assign(4096, 0.0f);
     chorusMask_ = 4095;
     for (auto& c : revC_) c.buf.assign(1, 0.0f);
@@ -289,9 +290,9 @@ void WavetableSynth::noteOn(int32_t pitch, float velocity) {
         v->clearSide();
         for (int u = 0; u < kUnison; ++u) {
             rng_ = rng_ * 1664525u + 1013904223u;
-            v->ph1[u] = (rng_ >> 8) / 16777216.0;
+            v->ph1[u] = (uint64_t)(((rng_ >> 8) / 16777216.0) * 18446744073709551616.0);
             rng_ = rng_ * 1664525u + 1013904223u;
-            v->ph2[u] = (rng_ >> 8) / 16777216.0;
+            v->ph2[u] = (uint64_t)(((rng_ >> 8) / 16777216.0) * 18446744073709551616.0);
         }
         v->subPh = 0.0;
     }
@@ -489,6 +490,36 @@ void WavetableSynth::render(float* out, int32_t frames) {
         lfoPhase2_ -= std::floor(lfoPhase2_);
     }
 
+    // Chorus tap phasor seed (Vital-style rotation): one sin+cos per block; every
+    // sample advances it by complex rotation instead of libm calls. Seeded from
+    // the authoritative chorusPh_ so sleep/wake needs no correction.
+    if (chorusOn && chAmt > 1e-4f) {
+        chorusSin_ = std::sin(kTwoPi * chorusPh_);
+        chorusCos_ = std::cos(kTwoPi * chorusPh_);
+        const double chD = kTwoPi * chRate * invSr;
+        chorusSinInc_ = std::sin(chD);
+        chorusCosInc_ = std::cos(chD);
+    }
+
+    // LFO sine rotators (Vital-style): seeded once per block, advanced by complex
+    // rotation per sample instead of std::sin. The skip is bit-identical: with zero
+    // depth the old path produced exact ±0.0, which can never propagate into any
+    // nonzero value through the uses below (adds, multiplies, exp2, clamps).
+    if (ls1 == 0 && lfo1Depth != 0.0f) {
+        lfoSin1_ = std::sin(kTwoPi * lfoPhase1_);
+        lfoCos1_ = std::cos(kTwoPi * lfoPhase1_);
+        const double d1 = kTwoPi * lfo1Inc;
+        lfoSinInc1_ = std::sin(d1);
+        lfoCosInc1_ = std::cos(d1);
+    }
+    if (ls2 == 0 && lfo2Depth != 0.0f) {
+        lfoSin2_ = std::sin(kTwoPi * lfoPhase2_);
+        lfoCos2_ = std::cos(kTwoPi * lfoPhase2_);
+        const double d2 = kTwoPi * lfo2Inc;
+        lfoSinInc2_ = std::sin(d2);
+        lfoCosInc2_ = std::cos(d2);
+    }
+
     float peak = 0.0f;
     if (!silentFast) {
     for (int32_t i = 0; i < frames; ++i) {
@@ -500,8 +531,27 @@ void WavetableSynth::render(float* out, int32_t frames) {
             lfoPhase2_ -= 1.0;
             lfoSh2_ = frand() * 2.0f - 1.0f;
         }
-        const double lfo1 = lfoValue(ls1, lfoPhase1_, lfoSh1_) * lfo1Depth;
-        const double lfo2 = lfoValue(ls2, lfoPhase2_, lfoSh2_) * lfo2Depth;
+        // LFO values: sine shape rides the per-block rotator (use-then-rotate
+        // matches the old use-then-advance order); zero depth skips bit-identically.
+        double lfo1, lfo2;
+        if (lfo1Depth == 0.0f) lfo1 = 0.0;
+        else if (ls1 == 0) {
+            lfo1 = lfoSin1_ * lfo1Depth;
+            const double s = lfoSin1_ * lfoCosInc1_ + lfoCos1_ * lfoSinInc1_;
+            const double c = lfoCos1_ * lfoCosInc1_ - lfoSin1_ * lfoSinInc1_;
+            lfoSin1_ = s;
+            lfoCos1_ = c;
+        } else
+            lfo1 = lfoValue(ls1, lfoPhase1_, lfoSh1_) * lfo1Depth;
+        if (lfo2Depth == 0.0f) lfo2 = 0.0;
+        else if (ls2 == 0) {
+            lfo2 = lfoSin2_ * lfo2Depth;
+            const double s = lfoSin2_ * lfoCosInc2_ + lfoCos2_ * lfoSinInc2_;
+            const double c = lfoCos2_ * lfoCosInc2_ - lfoSin2_ * lfoSinInc2_;
+            lfoSin2_ = s;
+            lfoCos2_ = c;
+        } else
+            lfo2 = lfoValue(ls2, lfoPhase2_, lfoSh2_) * lfo2Depth;
         lfoPhase1_ += lfo1Inc;
         lfoPhase2_ += lfo2Inc;
 
@@ -541,8 +591,7 @@ void WavetableSynth::render(float* out, int32_t frames) {
             // unison voice gets the cutoff, the envelope and the modulation (#193).
             float o1 = 0.0f, o2 = 0.0f, sd1 = 0.0f, sd2 = 0.0f;
             if (lvl1 > 1e-5f)
-                o1 = oscStack(
-                    v.ph1, base * m1, b1, pos1, wm1, warp1, uniN, uniDetF, uniPanL, uniPanR, uniNorm, sd1);
+                o1 = oscStack(v.ph1, base * m1, b1, pos1, wm1, warp1, uniN, uniDetF, uniPanL, uniPanR, uniNorm, sd1);
             if (lvl2 > 1e-5f)
                 o2 = oscStack(v.ph2, base * m2 * (osc2PitchStatic ? 1.0 : std::exp2(dst[1] * 2.0)), b2, pos2,
                     wm2, warp2, uniN, uniDetF, uniPanL, uniPanR, uniNorm, sd2);
@@ -666,11 +715,31 @@ void WavetableSynth::advEnv(float& e, Stage& st, float a, float d, float s, floa
 }
 
 void WavetableSynth::setSvf(SvfCoef& c, double fc, double k) const {
-    double g = std::tan(kPi * fc / sampleRate_);
+    const double x = kPi * fc / sampleRate_;
+    double g;
+    if (x <= 0.0) g = 0.0;
+    else if (x >= kTanMax)
+        g = tanTable()[1 << kTanBits];
+    else {
+        const double pos = x * ((1 << kTanBits) / kTanMax);
+        const int i0 = (int)pos;
+        const float f = (float)(pos - i0);
+        const float* t = tanTable();
+        g = (double)t[i0] + (double)(t[i0 + 1] - t[i0]) * (double)f;
+    }
     c.a1 = 1.0 / (1.0 + g * (g + k));
     c.a2 = g * c.a1;
     c.a3 = g * c.a2;
     c.k = k;
+}
+
+const float* WavetableSynth::tanTable() {
+    static const std::vector<float> t = [] {
+        std::vector<float> tab((1 << kTanBits) + 1);
+        for (int i = 0; i <= (1 << kTanBits); ++i) tab[(size_t)i] = std::tan(kTanMax * i / (1 << kTanBits));
+        return tab;
+    }();
+    return t.data();
 }
 
 double WavetableSynth::svf(const SvfCoef& c, double& ic1, double& ic2, double in, int type) {
@@ -726,7 +795,7 @@ float WavetableSynth::foldOut(float s, double amt) {
     return fast_math::sin(g * s * 0.25f); // == sin(π/2·g·s)
 }
 
-float WavetableSynth::oscStack(double* ph, double inc, int bank, float pos, int mode, double warpAmt, int uniN,
+float WavetableSynth::oscStack(uint64_t* ph, double inc, int bank, float pos, int mode, double warpAmt, int uniN,
     const double* detF, const float* panL, const float* panR, float norm, float& sideOut) {
     const float posF = pos * (kFrames - 1);
     const int f0 = std::clamp((int)posF, 0, kFrames - 1), f1 = std::min(f0 + 1, kFrames - 1);
@@ -734,60 +803,57 @@ float WavetableSynth::oscStack(double* ph, double inc, int bank, float pos, int 
     const float* t0 = frame(bank, f0);
     const float* t1 = frame(bank, f1);
     // Warp mode is block-constant: dispatch once outside the unison loop instead of
-    // per voice per sample. Modes 0 (Off) and 4 (Fold) leave the read phase alone
-    // (Fold post-processes the output); the arithmetic in modes 1–3 is unchanged,
-    // only the block-constant factors are hoisted — bit-identical in all cases.
+    // per voice per sample. Phases are 64-bit accumulators (Vital-style): the step
+    // truncates toward the exact fixed-point increment (drift ~1e-14/block) and the
+    // wrap is free overflow — no branch, no double→int conversion per voice.
+    // Bit-identical arithmetic within each branch; cross-build residual < -90 dB.
+    static constexpr double kTwo64 = 18446744073709551616.0;
     float accL = 0.0f, accR = 0.0f;
     if (mode == 0) {
         for (int u = 0; u < uniN; ++u) {
             float s = readMorph(t0, t1, ff, ph[u]);
             accL += s * panL[u];
             accR += s * panR[u];
-            ph[u] += inc * detF[u];
-            if (ph[u] >= 1.0) ph[u] -= 1.0;
+            ph[u] += (uint64_t)((inc * detF[u]) * kTwo64);
         }
     } else if (mode == 4) {
         for (int u = 0; u < uniN; ++u) {
             float s = foldOut(readMorph(t0, t1, ff, ph[u]), warpAmt);
             accL += s * panL[u];
             accR += s * panR[u];
-            ph[u] += inc * detF[u];
-            if (ph[u] >= 1.0) ph[u] -= 1.0;
+            ph[u] += (uint64_t)((inc * detF[u]) * kTwo64);
         }
     } else if (mode == 1) {
         const double m = 1.0 + warpAmt * 3.0;
         for (int u = 0; u < uniN; ++u) {
-            double p = ph[u] * m;
-            double rp = p - std::floor(p);
-            float s = readMorph(t0, t1, ff, rp);
+            double p = (double)(ph[u] >> 11) * (1.0 / 9007199254740992.0);
+            double rp = p * m - std::floor(p * m);
+            float s = readMorph(t0, t1, ff, (uint64_t)(rp * kTwo64));
             accL += s * panL[u];
             accR += s * panR[u];
-            ph[u] += inc * detF[u];
-            if (ph[u] >= 1.0) ph[u] -= 1.0;
+            ph[u] += (uint64_t)((inc * detF[u]) * kTwo64);
         }
     } else if (mode == 2) {
         const double d = std::clamp(0.5 + (warpAmt - 0.5) * 0.9, 0.05, 0.95);
         const double d1 = 1.0 - d;
         for (int u = 0; u < uniN; ++u) {
-            double p = ph[u];
+            double p = (double)(ph[u] >> 11) * (1.0 / 9007199254740992.0);
             double rp = p < d ? 0.5 * p / d : 0.5 + 0.5 * (p - d) / d1;
-            float s = readMorph(t0, t1, ff, rp);
+            float s = readMorph(t0, t1, ff, (uint64_t)(rp * kTwo64));
             accL += s * panL[u];
             accR += s * panR[u];
-            ph[u] += inc * detF[u];
-            if (ph[u] >= 1.0) ph[u] -= 1.0;
+            ph[u] += (uint64_t)((inc * detF[u]) * kTwo64);
         }
     } else { // mode 3 (PWM-ish)
         const double w = 0.05 + warpAmt * 0.9;
         const double w1 = 1.0 - w;
         for (int u = 0; u < uniN; ++u) {
-            double p = ph[u];
+            double p = (double)(ph[u] >> 11) * (1.0 / 9007199254740992.0);
             double rp = p < w ? 0.5 * p / w : 0.5 + 0.5 * (p - w) / w1;
-            float s = readMorph(t0, t1, ff, rp);
+            float s = readMorph(t0, t1, ff, (uint64_t)(rp * kTwo64));
             accL += s * panL[u];
             accR += s * panR[u];
-            ph[u] += inc * detF[u];
-            if (ph[u] >= 1.0) ph[u] -= 1.0;
+            ph[u] += (uint64_t)((inc * detF[u]) * kTwo64);
         }
     }
     accL *= norm;
@@ -887,12 +953,14 @@ void WavetableSynth::chorus(float l, float r, float amt, int voices, double rate
     chorusBuf_[chorusW_] = (l + r) * 0.5f;
     chorusPh_ += rateHz / sampleRate_;
     if (chorusPh_ >= 1.0) chorusPh_ -= 1.0;
-    // Delay-time LFO — REVERTED to std:: (measured ≈ −51 dB with fast_math::sin: a
-    // 0.2-sample tap error on full-band wavetable content is audible in the null).
-    // The 1, 2 or 4 taps sit at exact quarter-turn offsets of one LFO angle, so a
-    // single sin (plus cos for 4 taps) derives them all via {s,c,-s,-c}
-    // quarter-turn identities instead of one sin per tap per sample
-    const double s = std::sin(kTwoPi * chorusPh_);
+    // Delay-time LFO via rotation (Vital-style): the phasor was seeded per block
+    // in render(); advance-then-use preserves the old advance-then-sin order, so
+    // the trajectory matches to ~1e-13 per block (null-clean, no libm per sample).
+    // The 1, 2 or 4 taps sit at exact quarter-turn offsets: {s,c,-s,-c}.
+    const double s = chorusSin_ * chorusCosInc_ + chorusCos_ * chorusSinInc_;
+    const double c = chorusCos_ * chorusCosInc_ - chorusSin_ * chorusSinInc_;
+    chorusSin_ = s;
+    chorusCos_ = c;
     auto tapS = [&](double sk) {
         double d = (0.008 + 0.006 * sk) * sampleRate_;
         double rp = (double)chorusW_ - d;
@@ -911,7 +979,6 @@ void WavetableSynth::chorus(float l, float r, float amt, int voices, double rate
         a = tapS(s);
         b = tapS(-s);
     } else { // voices == 4
-        const double c = std::cos(kTwoPi * chorusPh_);
         a = tapS(s) + tapS(-s);
         b = tapS(c) + tapS(-c);
     }

@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -203,7 +204,11 @@ class WavetableSynth final : public Instrument {
         bool active = false;
         int32_t pitch = 0;
         double freq = 0, ktOct = 0, rand = 0;
-        double ph1[kUnison] = {}, ph2[kUnison] = {}, subPh = 0;
+        // Integer unison phases (Vital-style): 64-bit accumulators, wrap by
+        // overflow (no branch), table index from the top 11 bits, 21-bit
+        // fraction below. Drift vs double accumulation is ~1e-14/block.
+        uint64_t ph1[kUnison] = {}, ph2[kUnison] = {};
+        double subPh = 0;
         float velocity = 0, env = 0, env2 = 0;
         Stage stage = Stage::Attack, stage2 = Stage::Attack;
         SvfCoef f[2];
@@ -251,6 +256,12 @@ class WavetableSynth final : public Instrument {
     static void advEnv(float& e, Stage& st, float a, float d, float s, float r);
 
     void setSvf(SvfCoef& c, double fc, double k) const;
+    // Process-static tan lookup (Vital-style): setSvf needs tan() per voice every
+    // 16 samples; a 2048-entry table over [0, kTanMax] with linear interpolation
+    // replaces it (built once, read-only afterwards — AR-6 safe).
+    static const float* tanTable();
+    static constexpr double kTanMax = 1.54; // >= pi * 0.49 (max clamped cutoff)
+    static constexpr int kTanBits = 11;
     static double svf(const SvfCoef& c, double& ic1, double& ic2, double in, int type);
 
     // Filter 1 and 2 on one signal, in parallel or series, through one set of integrator
@@ -266,7 +277,7 @@ class WavetableSynth final : public Instrument {
     // across the stereo field with equal power. Returns the mid (which the filters see)
     // and, through `sideOut`, the half-difference the spread opens up.
     // detF/panL/panR/norm are block-constant per-unison data prepared by render().
-    float oscStack(double* ph, double inc, int bank, float pos, int mode, double warpAmt, int uniN,
+    float oscStack(uint64_t* ph, double inc, int bank, float pos, int mode, double warpAmt, int uniN,
         const double* detF, const float* panL, const float* panR, float norm, float& sideOut);
     // Sub oscillator: the sine DEFINES pitch and stays std::-exact.
     static float subOsc(int wave, double ph) {
@@ -278,15 +289,13 @@ class WavetableSynth final : public Instrument {
     }
 
     const float* frame(int bank, int f) const { return tables_ + (size_t)((bank * kFrames) + f) * kTableSize; }
-    // Wavetable position interpolation — pitch-critical, stays std::-exact.
-    // `phase` is always in [0, 1) here, so x is in [0, 2048): truncation toward
-    // zero is exactly floor for non-negative values (no std::floor call).
-    static float readMorph(const float* t0, const float* t1, float ff, double phase) {
-        const double x = phase * kTableSize;
-        const int xi = (int)x;
-        int i0 = xi & (kTableSize - 1);
+    // Wavetable position interpolation from an integer phase — pitch-critical,
+    // stays std::-exact. Top (64 - tsh) bits index the tsz-point table, the next
+    // 21 bits are the fraction (branchless, no float conversion).
+    static float readMorph(const float* t0, const float* t1, float ff, uint64_t phase) {
+        int i0 = (int)((phase >> 53) & (kTableSize - 1));
         int i1 = (i0 + 1) & (kTableSize - 1);
-        const float xf = (float)(x - (double)xi);
+        const float xf = (float)((phase >> 32) & 0x1FFFFFu) * (1.0f / 2097152.0f);
         const float a = t0[i0] + (t0[i1] - t0[i0]) * xf;
         const float b = t1[i0] + (t1[i1] - t1[i0]) * xf;
         return a + (b - a) * ff;
@@ -350,6 +359,12 @@ class WavetableSynth final : public Instrument {
     float exprCoef_ = exprSmoothCoef(44100.0);
     GlobalExpr gexpr_; // pitch wheel / channel pressure (pitch −1)
     double lfoPhase1_ = 0, lfoPhase2_ = 0, chorusPh_ = 0;
+    // Rotating tap/LFO phasors (Vital-style): seeded once per block, advanced by
+    // complex rotation per sample — no per-sample sin/cos. (s, c) state with
+    // (sinInc, cosInc) per-block increment; re-anchored every block (~1e-13 error).
+    double chorusSin_ = 0.0, chorusCos_ = 1.0, chorusSinInc_ = 0.0, chorusCosInc_ = 1.0;
+    double lfoSin1_ = 0.0, lfoCos1_ = 1.0, lfoSinInc1_ = 0.0, lfoCosInc1_ = 1.0;
+    double lfoSin2_ = 0.0, lfoCos2_ = 1.0, lfoSinInc2_ = 0.0, lfoCosInc2_ = 1.0;
     float lfoSh1_ = 0, lfoSh2_ = 0;
     uint32_t rng_ = 0x51ed270bu;
     const float* tables_ = nullptr; // shared, read-only (sharedTables)
