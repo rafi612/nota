@@ -152,6 +152,9 @@ std::vector<Scenario> scenarios() {
         s.push_back({id, name + " x" + std::to_string(kEffectCopies) + " on Synth"});
     }
     for (int n : {1, 4, 8, 16, 32}) s.push_back({"mix-" + std::to_string(n), std::to_string(n) + " tracks, all playing"});
+    // US1 prune target: groups + send return with half the leaves muted, so two
+    // groups carry silence (skipped) while the return still rings from the rest.
+    s.push_back({"mix-16-g", "16 tracks in 4 groups + send return, half muted"});
     s.push_back({"sparse-32", "32 tracks, 1 in 4 playing"});
     s.push_back({"silent-32", "32 tracks, no clips"});
     return s;
@@ -184,8 +187,33 @@ bool build(NotaEngine* e, const std::string& id) {
         }
         return true;
     }
+    if (id == "mix-16-g") {
+        // Same leaf chain as mix-16, folded into 4 groups of 4 with a send
+        // reverb; the upper two groups are muted so only their prune skip is new.
+        int ids[16];
+        for (int i = 0; i < 16; ++i) {
+            const int t = instrumentTrack(e, 6);
+            if (t <= 0) return false;
+            fillClip(e, t, (i % 5) * 2 - 4, 0, 16);
+            nota_track_add_builtin_device(e, t, 0);
+            nota_track_add_builtin_device(e, t, 1);
+            nota_track_add_builtin_device(e, t, 7);
+            ids[i] = t;
+        }
+        for (int gg = 0; gg < 4; ++gg) {
+            const int gid = nota_engine_create_group(e, &ids[gg * 4], 4);
+            if (gid <= 0) return false;
+            nota_track_add_builtin_device(e, gid, 0); // group chain cost
+        }
+        const int ret = nota_engine_add_return_track(e);
+        if (ret <= 0) return false;
+        if (nota_track_add_builtin_device(e, ret, 2) < 0) return false; // Reverb
+        for (int i = 0; i < 16; ++i) nota_track_set_send(e, ids[i], 0, 0.25f);
+        for (int i = 8; i < 16; ++i) nota_track_set_mute(e, ids[i], 1);
+        return true;
+    }
     int n = 0;
-    if (std::sscanf(id.c_str(), "mix-%d", &n) == 1) {
+    if (std::sscanf(id.c_str(), "mix-%d", &n) == 1 && id != "mix-16-g") {
         // The stress-test chain on each track: Volt + EQ-8 + Compressor + Auto Filter.
         for (int i = 0; i < n; ++i) {
             const int t = instrumentTrack(e, 6);

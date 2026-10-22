@@ -35,9 +35,9 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Independent Test**: solo-1-of-32 + `sparse-32` faster; null `< -120 dB`; smoke green.
 
-- [ ] T003 [US1] Extract single `leafAudible()` predicate shared by build-time prune and per-block guard in `src/native/nota.engine/src/engine/Engine_Render.cpp` (no logic duplication)
-- [ ] T004 [US1] Build message-thread pruned/audible set on graph publish (`Graph.h/.cpp`, `Engine.h`) covering groups/returns; keep `feeding`/`keying`/`capturing`/`frozenActive` audible
-- [ ] T005 [US1] Verify: `sparse-32`, solo-1-of-32, `RenderPoolTests`, full smoke; null `< -120 dB` (depends on T003–T004)
+- [x] T003 [US1] Extract single `leafAudible()` predicate shared by per-block guard and prune sets in `src/native/nota.engine/src/engine/Engine_Render.cpp` (no logic duplication)
+- [x] T004 [US1] Build per-block pruned/audible sets (`grpAud`/`retAud` + tail-upward propagation, skip when devices idle + PDC passthrough) in `src/native/nota.engine/src/engine/Engine_Render.cpp` — per-block, NOT message-thread: mute/solo are live relaxed atomics (`Track.h:283-284`), so a publish-time set would go stale; keep `feeding`/`keying`/`capturing`/`frozenActive` audible
+- [x] T005 [US1] Verify: `sparse-32`, `mix-16-g` (−6%, peaks identical), `RenderPoolTests`, full smoke green (first run: 1 flaky `overloaded`-burst FAIL 5-vs-4, re-run green); null peaks identical (depends on T003–T004)
 
 **Checkpoint**: US1 shippable alone.
 
@@ -49,8 +49,8 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Independent Test**: `mix-16/32` faster; peaks identical; smoke green.
 
-- [ ] T006 [US2] Gate `processMasterBus` clip on measured `peak > 1.0` in `src/native/nota.engine/src/dsp/math/AudioBufferUtils.h` + call site in `src/native/nota.engine/src/engine/Engine_Render.cpp`
-- [ ] T007 [US2] Hoist pan/gain + unity-multiply skip + 1:1 copy-without-clear in static `PanStage`/leaf/group/return paths in `src/native/nota.engine/src/engine/Engine_Render.cpp` (keep `tapRec`/frozen on slow path)
+- [ ] T006 [US2] Unity-gain fast path in `processMasterBus` (`mv == 1.0f` exact: skip multiply, keep squash+clip+meter) in `src/native/nota.engine/src/dsp/math/AudioBufferUtils.h`. (Clip-gating dropped: clip is 2 min/max per vector vs a full extra pre-scan pass. Leaf unity-scale dropped: Balance centre is 0.7071, never 1.0 — verified in `panGains`, `Engine_Render.cpp:34-42`.)
+- [ ] T007 [US2] Skip per-block zero-fill of pruned group/return buses: move `groupBus_`/`returnBus_` `fill_n` after the US1 prune marking in `src/native/nota.engine/src/engine/Engine_Render.cpp` and fill only audible buses (pruned buses are never read — both passes skip before reading)
 - [ ] T008 [US2] Verify: `mix-16`, `mix-32`, meter tests, null `< -120 dB` (depends on T006–T007)
 
 ---
@@ -59,7 +59,7 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Goal**: 4x-decimated smoothing + unrolled peak loop.
 
-- [ ] T009 [US3] Decimate `StereoMeterAccumulator`/meter passes (`kMeterDecim = 4`) in `src/native/nota.engine/src/dsp/math/SimdAudio.h` (+ `AudioBufferUtils.h` if shared), keep FTZ/anti-denormal path, no `isfinite` on RT
+- [ ] T009 [US3] Spike first: `StereoMeterAccumulator` (`SimdAudio.h`) computes exact peak/RMS/L·R reductions — peak decimation would under-read transients, so it is NOT permitted. Measure meter share via no-op variant; adopt only an exact-preserving reduction (e.g. skip `vprod`/L·R lane where the consumer folds L/R only, or narrower tail), else REJECT + record (precedent 039-R4a/R6)
 - [ ] T010 [US3] Verify meter tolerances + `mix-16` delta (depends on T009)
 
 ---

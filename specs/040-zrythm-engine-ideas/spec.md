@@ -210,10 +210,13 @@ no RT alloc (RTSan/`NOTA_RT_SAFE` clean).
 ### Functional Requirements
 
 - **FR-001**: Pruning (US1) MUST derive from the single audibility predicate
-  in `Engine_Render.cpp`, run on graph build (message thread), and keep
-  `feeding`/`keying`/`capturing` tracks rendering.
-- **FR-002**: Master/mixer fast paths (US2) MUST null `< -120 dB` vs baseline
-  and keep `tapRec`/frozen behaviour unchanged.
+  in `Engine_Render.cpp`, evaluated per block (mute/solo are live atomics, a
+  publish-time set would go stale), and keep
+  `feeding`/`keying`/`capturing`/`frozenActive` tracks rendering.
+- **FR-002**: Master bus (US2) MUST skip the gain multiply when `mv == 1.0f`
+  exactly (squash+clip+meter always run) and skip zero-fills of pruned
+  group/return buses (never read when pruned), nulling `< -120 dB` vs baseline
+  and keeping `tapRec`/frozen behaviour unchanged.
 - **FR-003**: Decimated meters (US3) MUST stay within smoke-test meter
   tolerances and MUST NOT use `isfinite`/NaN checks on the audio thread.
 - **FR-004**: Voice parallelism (US4) MUST be gated

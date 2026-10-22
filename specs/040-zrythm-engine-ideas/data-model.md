@@ -2,12 +2,16 @@
 
 ## 1. Pruned set (US1)
 
-- **Storage**: message-thread `vector<char> audible_` per graph build, sized to
-  track count; published via immutable snapshot (AR-5).
-- **Predicate**: single function `leafAudible(t, solo/mute/monitor/capture/tap)`
-  shared by prune build and per-block guard — never duplicated logic.
+- **Storage**: per-block `bool grpAud[]`/`retAud[]` stack arrays (O(tracks +
+  groups)), computed after the leaf loop, before the parallel dispatch.
+  Per-block because mute/solo are live relaxed atomics (`Track.h:283-284`).
+- **Predicate**: single `leafAudibleBase()` shared by the leaf guard and the
+  prune marking — never duplicated logic.
 - **Invariants**: `capturing || frozenActive || feeding || keying` ⇒ audible;
-  `tapRec` sources audible for their taps.
+  a group that will process (audible subtree or non-idle devices) marks its
+  parent audible (tails flow upward); skip additionally requires own devices
+  idle + PDC passthrough (`CompensationDelay::isIdle`). `tapRec` sources keep
+  the slow path.
 
 ## 2. Fast mixer path (US2)
 

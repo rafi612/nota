@@ -2029,6 +2029,9 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             int s = slotOf(t.groupId());
             return s >= 0 && grpSoloE[s];
         };
+        // Single audibility predicate (US1): the per-block guard in the leaf
+        // loop and the prune sets below share this — never duplicate the logic.
+        auto leafAudibleBase = [&](Track& t) { return !leafMute(t) && (!anySolo || leafSolo(t)); };
 
         // Session vs Arrangement (M5): when the Arrangement isn't active (a session-only jam),
         // tracks with no launched session clip stay silent instead of playing their timeline.
@@ -2067,7 +2070,7 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             // mixer mute/solo gate (freeze captures the sound the track makes, not the mix)
             // — otherwise a soloed sibling would punch silent gaps into the buffer.
             const bool capturing = (t.id() == capTrackId);
-            const bool audible = !leafMute(t) && (!anySolo || leafSolo(t));
+            const bool audible = leafAudibleBase(t);
             // Soloing a monitoring (or recording) track must not silence what it listens to.
             const bool feeding = !audible && !leafMute(t) && feedsMonitor(t.id());
             // A sidechain source keeps rendering for its taps when muted or solo-gated, the way a
@@ -2165,6 +2168,35 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
                     }
             w.eligible = eligible;
         }
+
+        // Per-block prune sets (US1): which groups/returns can carry signal this
+        // block. Only toMix leaves fold into group buses and sends (the serial
+        // accumulate guards both on w.toMix); feeding/keying leaves only tap
+        // route buses, which are cleared per block, so skipping zero-adds is exact.
+        auto devicesIdle = [&](Track& t) {
+            for (auto& d : t.devices)
+                if (d && !d->bypassed() && !d->isIdle()) return false;
+            return true;
+        };
+        bool grpAud[kMaxGroups] = {};
+        bool retAud[kMaxReturns] = {};
+        for (size_t li = 0; li < ntracks; ++li) {
+            const LeafWork& w = rs_->leafWork[li];
+            if (!w.t || !w.toMix) continue;
+            for (int s = slotOf(w.t->groupId()); s >= 0; s = slotOf(grpParent[s])) grpAud[(size_t)s] = true;
+            if (w.anySend)
+                for (int b = 0; b < numReturns; ++b)
+                    if (w.sends[b] != 0.0f) retAud[b] = true;
+        }
+        // Tails flow upward: a group that will process (audible input or its own
+        // non-idle devices) makes its parent audible for this block.
+        for (int depth = maxDepth; depth >= 1; --depth)
+            for (int gi = 0; gi < numGroups; ++gi) {
+                if (grpDepth[gi] != depth) continue;
+                if (!grpAud[gi] && devicesIdle(*grpT[gi])) continue; // skips: nothing flows up
+                const int p = slotOf(grpParent[gi]);
+                if (p >= 0) grpAud[(size_t)p] = true;
+            }
 
         // Parallel DSP phase: eligible leaves render dry into their own
         // rs_->leafBuf region, copy to the post half, run devices in place
@@ -2383,6 +2415,14 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
                     t.setMeter(0, 0, 0, 0);
                     continue;
                 } // muted group (or muted ancestor)
+                // Pruned group (US1): no audible contributor in its subtree and
+                // its own chain is settled (devices idle, PDC passthrough), so the
+                // bus holds zeros and every tap-add below would add zeros to
+                // per-block-cleared buffers. Skip bit-identically.
+                if (!grpAud[gi] && devicesIdle(t) && (!t.pdc || t.pdc->isIdle())) {
+                    t.setMeter(0, 0, 0, 0);
+                    continue;
+                }
 
                 std::copy_n(groupBus_[gi].data(), frames * 2, scratch_.data()); // this group's summed children
                 {
@@ -2461,6 +2501,15 @@ void Engine::mixGraph(Graph* g, float* out, int32_t frames, double blockStart, b
             if (t.type() != TrackType::Return) continue;
             const int32_t bus = t.returnIndex();
             if (bus < 0 || bus >= numReturns || t.mute()) {
+                t.setMeter(0, 0, 0, 0);
+                t.stereoFold(0, 0, 0, frames, stereoA);
+                continue;
+            }
+            // Pruned return (US1): no audible send into this bus and the chain
+            // is settled (devices idle, PDC passthrough) — the bus holds zeros
+            // (cleared per block), so processing would render silence. Tails ring
+            // out through the non-idle path exactly as before.
+            if (!retAud[bus] && devicesIdle(t) && (!t.pdc || t.pdc->isIdle())) {
                 t.setMeter(0, 0, 0, 0);
                 t.stereoFold(0, 0, 0, frames, stereoA);
                 continue;
