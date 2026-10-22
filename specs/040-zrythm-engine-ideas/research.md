@@ -44,6 +44,31 @@ Nothing below is copied; file:line refs are provenance for the idea only.
   (`fork_join_executor.cpp:30-33` analogue) + measured ≥ 1.2x on
   `aurora-supersaw-2x`, else REJECT (precedent 037-R4, 039-R4a/R6).
 
+## R4b: Voice-shard spike — IMPLEMENTED, MEASURED, REVERTED (2026-10-22)
+
+- Built: tiled block render (512-sample tiles) with a precomputed per-tile LFO
+  series (identical `frand`/rotator trajectories), 2 voice shards sharing
+  read-only state, serial ordered sum; `ShardExec{pool,busy}` plumbing
+  (`Instrument::setShardExec`, `Engine::shardPool_` with 1 helper, lock-free
+  claim flag preserving the pool's single-publisher discipline — same-pool
+  nesting is UNSAFE: shared `done_`/`doneBase_` lets an inner wait exit early
+  on outer completions, hence a separate pool exactly like Zrythm).
+- Sound: serial shards null **−137 dB** (FP summation order only); full revert
+  nulls **−240 dB** (bit-identical).
+- Perf: real 2-thread shards measured **+4.6% slower** on `aurora-supersaw-2x`
+  in a clean window (tight spreads both arms). Mechanism understood:
+  per-block shard work is ~45–90 us while a parked-worker wake on macOS costs
+  tens of us — every 512-frame block pays a wake it cannot amortize; the
+  pool's linger heuristic (tuned for block cadence) parks between tiles.
+  Gate was ≥ 1.2x: missed by a mile.
+- Serial-restructure side observation (−3.4% in one clean window) proved
+  environment-sensitive under a contaminated machine (`dasd` at 99% CPU:
+  baseline bimodal 15.6/16.8) and unattributable; scaffolding for a rejected
+  idea does not ship (same standard as 037-R4, 039-R6).
+- Decision: FULLY REVERTED (no dead plumbing left behind). A future attempt
+  needs zero-wake dispatch or coarser shards with a different wake-up story,
+  not a different loop shape.
+
 ## R5: Port source cache + subspans — ADOPT (US5)
 
 - Zrythm `port.h:202-257` (`set_port_sources` on message thread),

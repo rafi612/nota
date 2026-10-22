@@ -68,8 +68,8 @@ description: "Task list for Feature 040: Engine Optimizations Inspired by Zrythm
 
 **Goal**: Adopt only on ≥ 1.2x measured win.
 
-- [ ] T011 [US4] Spike: voice-shard render with serial ordered sum + thresholds (`>= 2` voices, `>= 16` frames) in one heavy synth (Aurora first: `src/native/nota.engine/src/devices/instruments/WavetableSynth.cpp`), serial fallback + nested-dispatch guard
-- [ ] T012 [US4] Measure `aurora-supersaw-2x`/`instrument-05`: adopt (wire remaining paths + null `< -120 dB`) or REVERT + record in `research.md` (depends on T011)
+- [x] T011 [US4] Spike: tiled voice-shard restructure (precomputed LFO series, serial ordered sum) in `WavetableSynth.cpp/.h` — null −137 dB, serial overhead measured; threading via `ShardExec` + dedicated 1-helper pool (same-pool nesting proven unsafe: shared `done_`/`doneBase_`)
+- [x] T012 [US4] Measure: real 2-thread shards +4.6% (parked-worker wake >> shard work) → REJECT + FULL REVERT (revert verified: null −240 dB, perf back in orig band); recorded in `research.md` R4b (depends on T011)
 
 ---
 

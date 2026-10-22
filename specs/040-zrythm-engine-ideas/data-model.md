@@ -32,6 +32,9 @@
 - **Storage**: prepare-time scratch `numVoices * ch * maxBlock` + `activeIdx[]`.
 - **Dispatch**: `voices >= kMinVoices && frames >= kMinFrames` (defaults 2/16,
   tuned in tasks); serial ordered sum; nested-dispatch guard falls back serial.
+- **Outcome (R4b)**: REJECTED and fully reverted — real 2-thread shards +4.6%
+  (parked-worker wake >> shard work); serial-restructure side effect
+  unattributable under load. Section kept for the record; no shard code ships.
 
 ## 5. Port source cache (US5)
 
